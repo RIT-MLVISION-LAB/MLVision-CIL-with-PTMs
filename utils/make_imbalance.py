@@ -3,12 +3,12 @@ import torch
 from torch.utils.data import Subset
 
 
-def _extract_labels(dataset):
+def extract_labels(dataset):
     if isinstance(dataset, Subset):
         base = dataset.dataset                   # the underlying dataset
         indices = np.array(dataset.indices)      # list of ints
         # Extract all labels from base (recursively)
-        all_labels = _extract_labels(base)       # this returns a numpy array of shape (len(base),)
+        all_labels = extract_labels(base)       # this returns a numpy array of shape (len(base),)
         # Now pick only those at `indices` (and preserve their ordering as stored in subset.indices)
         return all_labels[indices]
 
@@ -36,7 +36,7 @@ def _extract_labels(dataset):
 
 def make_inter_class_imbalance(dataset, beta):
 
-    labels = _extract_labels(dataset)
+    labels = extract_labels(dataset)
     classes = np.unique(labels)
     classes_sorted = np.sort(classes)
     num_classes = len(classes_sorted)
