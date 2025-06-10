@@ -8,10 +8,10 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from utils.inc_net import MOSNet
 from models.base import BaseLearner
-from utils.toolkit import tensor2numpy, target2onehot
+from utils.toolkit import tensor2numpy
 from torch.distributions.multivariate_normal import MultivariateNormal
-
-
+from utils.make_imbalance import make_inter_class_imbalance, make_intra_task_imbalance, count_classes, reduce_training_dataset, extract_labels
+    
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
 
@@ -63,7 +63,7 @@ class Learner(BaseLearner):
         embedding_list = torch.cat(embedding_list, dim=0)
         label_list = torch.cat(label_list, dim=0)
         
-        class_list = np.unique(self.train_dataset.labels)
+        class_list = np.unique(extract_labels(self.train_dataset))
         for class_index in class_list:
             data_index = (label_list == class_index).nonzero().squeeze(-1)
             embedding = embedding_list[data_index]
@@ -83,15 +83,44 @@ class Learner(BaseLearner):
         
         self._network.update_fc(self._total_classes)
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
+        self.data_manager = data_manager
 
         self.train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source="train", mode="train")
-        self.data_manager = data_manager
-        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test" )
-        self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
-        
         train_dataset_for_protonet = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="test")
+        
+
+
+        imbalance = "intra"
+        mode = "ascending"#'descending' # "acsending"
+
+        if imbalance=="inter":
+            self.train_dataset = make_inter_class_imbalance(self.train_dataset, 1)
+            train_dataset_for_protonet = make_inter_class_imbalance(train_dataset_for_protonet, 1)
+
+        elif imbalance=="intra":
+            self.train_dataset = make_intra_task_imbalance(self.train_dataset, 
+                                                            task_id=self._cur_task, 
+                                                            num_tasks=data_manager.nb_tasks, 
+                                                            mode=mode)
+            train_dataset_for_protonet = make_intra_task_imbalance(train_dataset_for_protonet,
+                                                            task_id=self._cur_task, 
+                                                            num_tasks=data_manager.nb_tasks, 
+                                                            mode=mode)
+        elif imbalance=="none":
+            self.train_dataset = reduce_training_dataset(self.train_dataset)
+            train_dataset_for_protonet = reduce_training_dataset(train_dataset_for_protonet)
+
+        
+        a=count_classes(self.train_dataset)
+        b=count_classes(train_dataset_for_protonet)
+        c = 0
+        
+        print(f"Train dataset size {len(self.train_dataset)}")
+        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
         self.train_loader_for_protonet = DataLoader(train_dataset_for_protonet, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+
 
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
