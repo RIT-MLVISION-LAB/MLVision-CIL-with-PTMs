@@ -1,8 +1,10 @@
 import json
 import argparse
 from trainer import train
+from dotenv import load_dotenv
 
 def main():
+    load_dotenv()
     args = setup_parser().parse_args()
     param = load_json(args.config)
     args = vars(args) # Converting argparse Namespace to a dict.
