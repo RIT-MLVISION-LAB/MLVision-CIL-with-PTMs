@@ -1,6 +1,7 @@
 import numpy as np
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
+from datasets import load_dataset
 
 
 class iData(object):
@@ -64,6 +65,120 @@ class iCIFAR100(iData):
         self.test_data, self.test_targets = test_dataset.data, np.array(
             test_dataset.targets
         )
+
+
+class iCIFAR100LT(iData):
+    def __init__(self, args): 
+        super().__init__()
+        self.args = args
+        #self.imbalance_ratio = args.imbalance_ratio #"r-10", "r-50", or "r-100"
+        self.use_path = False
+        #self.class_order_mode = args.class_order_mode # 'random','inc','dec'
+
+        # Follow the same pattern as iCIFAR224
+        if args["model_name"] == "coda_prompt":
+            self.train_trsf = build_transform_coda_prompt(True, args)
+            self.test_trsf = build_transform_coda_prompt(False, args)
+        else:
+            self.train_trsf = build_transform(True, args)
+            self.test_trsf = build_transform(False, args)
+        
+        self.common_trsf = [
+            # transforms.ToTensor() is already included in build_transform
+        ]
+
+        self.class_order = []
+        
+    def create_head_first_inc_ordering(self, class_counts, num_head_classes=10):
+        """
+        Create custom ordering: top N head classes first, then remaining in increasing order
+        
+        Args:
+            class_counts: dict {class_id: sample_count}
+            num_head_classes: number of head classes to put first (default 10)
+        
+        Returns:
+            list: ordered class IDs
+        """
+        # Sort all classes by sample count (decreasing)
+        sorted_classes = sorted(class_counts.items(), key=lambda x: -x[1])
+        # Get the top N head classes
+        head_classes = [cls for cls, _ in sorted_classes[:num_head_classes]]
+        # Get remaining classes and sort them in increasing order
+        remaining_classes = sorted_classes[num_head_classes:]
+        tail_classes = [cls for cls, _ in sorted(remaining_classes, key=lambda x: x[1])]
+        
+        # Combine: head classes first, then increasing tail classes
+        final_order = head_classes + tail_classes
+        
+        return final_order
+    
+    def create_tail_first_dec_ordering(self, class_counts, num_tail_classes=10):
+        """
+        Create custom ordering: bottom N tail classes first, then remaining in decreasing order
+        
+        Args:
+            class_counts: dict {class_id: sample_count}
+            num_tail_classes: number of tail classes to put first (default 10)
+        
+        Returns:
+            list: ordered class IDs
+        """
+        # Sort all classes by sample count (increasing)
+        sorted_classes = sorted(class_counts.items(), key=lambda x: x[1])
+        
+        # Get the bottom N tail classes (smallest sample counts)
+        tail_classes = [cls for cls, _ in sorted_classes[:num_tail_classes]]
+        
+        # Get remaining classes and sort them in decreasing order
+        remaining_classes = sorted_classes[num_tail_classes:]
+        head_classes = [cls for cls, _ in sorted(remaining_classes, key=lambda x: -x[1])]
+        
+        # Combine: tail classes first, then decreasing head classes
+        final_order = tail_classes + head_classes
+        
+        return final_order
+
+    def download_data(self):
+        train_dataset = load_dataset("tomas-gajarsky/cifar100-lt", self.args["imbalance_ratio"], split="train")
+        test_dataset = load_dataset("tomas-gajarsky/cifar100-lt", self.args["imbalance_ratio"], split="test")
+        
+        self.train_data = np.stack([np.array(x["img"]) for x in train_dataset])
+        self.train_targets = np.array([x["fine_label"] for x in train_dataset])
+        self.test_data = np.stack([np.array(x["img"]) for x in test_dataset])
+        self.test_targets = np.array([x["fine_label"] for x in test_dataset])
+        
+        class_counts = {cls: 0 for cls in range(100)}
+        for label in self.train_targets:
+            class_counts[label] += 1
+
+        class_order_mode = self.args["class_order_mode"]
+        if class_order_mode == "dec":
+            sorted_classes = sorted(class_counts.items(), key=lambda x: -x[1])
+            self.class_order = [cls for cls, _ in sorted_classes]
+            return
+        elif class_order_mode == "inc":
+            sorted_classes = sorted(class_counts.items(), key=lambda x: x[1])
+            self.class_order = [cls for cls, _ in sorted_classes]
+            return
+        elif class_order_mode == "random":
+            np.random.seed(1993)
+            sorted_classes = [(cls, class_counts[cls]) for cls in np.random.permutation(100)]
+            self.class_order = [cls for cls, _ in sorted_classes]
+            return
+        elif class_order_mode =="first":
+            self.class_order = self.create_head_first_inc_ordering(class_counts, 10)
+            return
+        elif class_order_mode == "last":
+            self.class_order = self.create_tail_first_dec_ordering(class_counts, 10) 
+            return  
+        else:
+            raise ValueError("Invalid class_order_mode: choose from ['random', 'head2tail', 'tail2head']")
+
+        
+
+
+        
 
 def build_transform_coda_prompt(is_train, args):
     if is_train:        
