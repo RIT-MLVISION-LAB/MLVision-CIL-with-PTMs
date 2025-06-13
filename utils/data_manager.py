@@ -3,8 +3,8 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-from utils.data import iCIFAR10, iCIFAR100, iCIFAR100LT, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR,iImageNetA,CUB, objectnet, omnibenchmark, vtab
-from utils.visualization import plot_class_distribution
+from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR, iImageNetR_Longtail, iImageNetA, CUB, CUB_Longtail, objectnet, omnibenchmark, vtab
+
 
 class DataManager(object):
     def __init__(self, dataset_name, shuffle, seed, init_cls, increment, args):
@@ -233,10 +233,14 @@ def _get_idata(dataset_name, args=None):
         return iCIFAR224(args)
     elif name == "imagenetr":
         return iImageNetR(args)
+    elif name == "imagenetr_lt":
+        return iImageNetR_Longtail(args)
     elif name == "imageneta":
         return iImageNetA()
     elif name == "cub":
         return CUB()
+    elif name == "cub_lt":
+        return CUB_Longtail()
     elif name == "objectnet":
         return objectnet()
     elif name == "omnibenchmark":

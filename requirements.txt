@@ -25,6 +25,7 @@ nvidia-nccl-cu11==2.14.3
 nvidia-nvtx-cu11==11.7.91
 packaging==25.0
 pillow==11.2.1
+python-dotenv==1.1.0
 PyYAML==6.0.2
 requests==2.32.3
 scipy==1.15.3

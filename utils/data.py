@@ -2,6 +2,7 @@ import numpy as np
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
 from datasets import load_dataset
+import os
 
 
 class iData(object):
@@ -340,14 +341,53 @@ class iImageNetR(iData):
 
     def download_data(self):
         # assert 0, "You should specify the folder of your dataset"
-        train_dir = "./data/imagenet-r/train/"
-        test_dir = "./data/imagenet-r/test/"
+        root_dir = os.getenv("IMAGENETR_ROOT")
+        train_dir = os.path.join(root_dir, "train")
+        test_dir = os.path.join(root_dir, "test")
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
 
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+class iImageNetR_Longtail(iData):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.use_path = True
+
+        if args["model_name"] == "coda_prompt":
+            self.train_trsf = build_transform_coda_prompt(True, args)
+            self.test_trsf = build_transform_coda_prompt(False, args)
+        else:
+            self.train_trsf = build_transform(True, args)
+            self.test_trsf = build_transform(False, args)
+        self.common_trsf = []
+
+        self.class_order = np.arange(200).tolist()  # sorted label IDs (0–199)
+
+    def _load_txt_split(self, root_dir, txt_file):
+        data, targets = [], []
+        with open(txt_file, 'r') as f:
+            for line in f:
+                path, label = line.strip().split()
+                full_path = os.path.join(root_dir, path)
+                data.append(full_path)
+                targets.append(int(label))
+        return np.array(data), np.array(targets)
+
+    def download_data(self):
+        root_dir = os.getenv("IMAGENETR_ROOT")
+        train_root_dir = os.path.join(root_dir, "train")
+        test_root_dir = os.path.join(root_dir, "test")
+        splits_dir = os.path.join(root_dir, "splits")
+
+        train_txt = os.path.join(splits_dir, "train_longtail.txt")
+        test_txt = os.path.join(splits_dir, "test.txt")
+
+        self.train_data, self.train_targets = self._load_txt_split(train_root_dir, train_txt)
+        self.test_data, self.test_targets = self._load_txt_split(test_root_dir, test_txt)
 
 
 class iImageNetA(iData):
@@ -381,16 +421,55 @@ class CUB(iData):
 
     class_order = np.arange(200).tolist()
 
+    def _load_split(self, root_dir, split_file):
+        data, targets = [], []
+        with open(split_file, 'r') as f:
+            for line in f:
+                path, label = line.strip().split()
+                full_path = os.path.join(root_dir, path)
+                data.append(full_path)
+                targets.append(int(label))
+        return np.array(data), np.array(targets)
+
     def download_data(self):
-        # assert 0, "You should specify the folder of your dataset"
-        train_dir = "./data/cub/train/"
-        test_dir = "./data/cub/test/"
+        root_dir = os.getenv("CUB_ROOT")
+        split_dir = os.path.join(root_dir, "splits")
 
-        train_dset = datasets.ImageFolder(train_dir)
-        test_dset = datasets.ImageFolder(test_dir)
+        train_split = os.path.join(split_dir, "train.txt")
+        test_split = os.path.join(split_dir, "test.txt")
 
-        self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
-        self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+        self.train_data, self.train_targets = self._load_split(root_dir, train_split)
+        self.test_data, self.test_targets = self._load_split(root_dir, test_split)
+
+class CUB_Longtail(iData):
+    use_path = True
+    
+    train_trsf = build_transform(True, None)
+    test_trsf = build_transform(False, None)
+    common_trsf = [    ]
+
+    class_order = np.arange(200).tolist()
+
+    def _load_split(self, root_dir, split_file):
+        data, targets = [], []
+        with open(split_file, 'r') as f:
+            for line in f:
+                path, label = line.strip().split()
+                full_path = os.path.join(root_dir, path)
+                data.append(full_path)
+                targets.append(int(label))
+        return np.array(data), np.array(targets)
+
+    def download_data(self):
+        root_dir = os.getenv("CUB_ROOT")
+        split_dir = os.path.join(root_dir, "splits")
+
+        train_split = os.path.join(split_dir, "train_longtail.txt")
+        test_split = os.path.join(split_dir, "test.txt")
+
+        self.train_data, self.train_targets = self._load_split(root_dir, train_split)
+        self.test_data, self.test_targets = self._load_split(root_dir, test_split)
+
 
 
 class objectnet(iData):

@@ -10,7 +10,7 @@ from utils.inc_net import MOSNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy, target2onehot
 from torch.distributions.multivariate_normal import MultivariateNormal
-
+from collections import defaultdict
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
@@ -244,6 +244,19 @@ class Learner(BaseLearner):
                 self.cls_mean[class_idx] = cluster_means
                 self.cls_cov[class_idx] = cluster_vars
 
+    @staticmethod
+    def ensure_positive_definite(cov, epsilon=1e-4, max_attempts=5):
+        identity = torch.eye(cov.size(0), device=cov.device)
+        for _ in range(max_attempts):
+            try:
+                torch.linalg.cholesky(cov + epsilon * identity)
+                return cov + epsilon * identity
+            except RuntimeError:
+                epsilon *= 10
+
+        diag = torch.clamp(torch.diag(cov), min=1e-3)   # fallback: force diagonal
+        return torch.diag(diag)
+
     def classifer_align(self, model):
         model.train()
         
@@ -266,6 +279,7 @@ class Learner(BaseLearner):
                     cov = self.cls_cov[class_idx].to(self._device)
                     if self.args["ca_storage_efficient_method"] == 'variance':
                         cov = torch.diag(cov)
+                    cov = self.ensure_positive_definite(cov)
                     m = MultivariateNormal(mean.float(), cov.float())
                     sampled_data_single = m.sample(sample_shape=(num_sampled_pcls,))
                     sampled_data.append(sampled_data_single)
@@ -358,6 +372,14 @@ class Learner(BaseLearner):
         self._network.eval()
         y_pred, y_true = [], []
         orig_y_pred = []
+        MAX_ITER = 4
+        class_stats = defaultdict(lambda: {
+            "count": 0,
+            "correct": 0,
+            "wrong_max_iter": 0,
+            "loop_list": []
+        })
+
         for _, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
             with torch.no_grad():
@@ -376,7 +398,6 @@ class Learner(BaseLearner):
                 # self-refined
                 final_logits = []
                 
-                MAX_ITER = 4
                 for x_id in range(len(inputs)):
                     loop_num = 0
                     prev_adapter_idx = orig_idx[x_id]
@@ -393,6 +414,20 @@ class Learner(BaseLearner):
                             prev_adapter_idx = cur_adapter_idx
                         
                     final_logits.append(cur_logits)
+
+                    # logging refinement statistics
+                    label = targets[x_id].item()
+                    pred = cur_pred[0]
+
+                    stat = class_stats[label]
+                    stat["count"] += 1
+                    stat["loop_list"].append(loop_num)
+                    if pred == label:
+                        stat["correct"] += 1
+                    else:
+                        if loop_num >= MAX_ITER:
+                            stat["wrong_max_iter"] += 1
+
                 final_logits = torch.cat(final_logits, dim=0).to(self._device)
 
                 if self.ensemble:
@@ -412,4 +447,17 @@ class Learner(BaseLearner):
 
         orig_acc = (np.concatenate(orig_y_pred) == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
         logging.info("the accuracy of the original model:{}".format(np.around(orig_acc, 2)))
+
+        # logging class-wise refinement statistics
+        print(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14}")
+        print("-" * 60)
+        logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14}")
+        logging.info("-" * 60)
+        for cls in sorted(class_stats.keys()):
+            entry = class_stats[cls]
+            acc = 100 * entry["correct"] / entry["count"] if entry["count"] > 0 else 0
+            avg_iter = np.mean(entry["loop_list"])
+            print(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14}")
+            logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14}")
+
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
