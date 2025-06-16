@@ -10,7 +10,9 @@ from utils.inc_net import MOSNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy, target2onehot
 from torch.distributions.multivariate_normal import MultivariateNormal
-from collections import defaultdict
+from collections import defaultdict, Counter
+from sklearn.metrics import confusion_matrix
+import os
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
@@ -377,7 +379,8 @@ class Learner(BaseLearner):
             "count": 0,
             "correct": 0,
             "wrong_max_iter": 0,
-            "loop_list": []
+            "loop_list": [],
+            "wrong_adapter_ids": Counter()
         })
 
         for _, (_, inputs, targets) in enumerate(loader):
@@ -427,6 +430,7 @@ class Learner(BaseLearner):
                     else:
                         if loop_num >= MAX_ITER:
                             stat["wrong_max_iter"] += 1
+                        stat["wrong_adapter_ids"][prev_adapter_idx.item()] += 1
 
                 final_logits = torch.cat(final_logits, dim=0).to(self._device)
 
@@ -449,15 +453,33 @@ class Learner(BaseLearner):
         logging.info("the accuracy of the original model:{}".format(np.around(orig_acc, 2)))
 
         # logging class-wise refinement statistics
-        print(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14}")
-        print("-" * 60)
-        logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14}")
-        logging.info("-" * 60)
+        print(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14} {'WrongAdapters':<20}")
+        print("-" * 90)
+        logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14} {'WrongAdapters':<20}")
+        logging.info("-" * 90)
         for cls in sorted(class_stats.keys()):
             entry = class_stats[cls]
             acc = 100 * entry["correct"] / entry["count"] if entry["count"] > 0 else 0
             avg_iter = np.mean(entry["loop_list"])
-            print(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14}")
-            logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14}")
+            wrong_adapter_summary = dict(entry["wrong_adapter_ids"])
+            print(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14} {wrong_adapter_summary}")
+            logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14} {wrong_adapter_summary}")
+
+        y_pred_flat = np.concatenate(y_pred)[:, 0]  # Take top-1 prediction
+        y_true_flat = np.concatenate(y_true)
+        cm = confusion_matrix(y_true_flat, y_pred_flat, labels=np.arange(self._total_classes))
+
+        init_cls = 0 if self.args ["init_cls"] == self.args["increment"] else self.args["init_cls"]
+        logs_dir = os.path.join(
+            "logs",
+            self.args["model_name"],
+            self.args["dataset"],
+            str(init_cls),
+            str(self.args["increment"]),
+            "confusions"
+        )
+        os.makedirs(logs_dir, exist_ok=True)
+        cm_save_path = os.path.join(logs_dir, f"cm_task_{self._cur_task}.npy")
+        np.save(cm_save_path, cm)
 
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
