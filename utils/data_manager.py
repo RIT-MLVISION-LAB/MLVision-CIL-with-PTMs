@@ -3,7 +3,7 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR, iImageNetR_Longtail, iImageNetA, CUB, CUB_Longtail, objectnet, omnibenchmark, vtab
+from utils.data import iCIFAR10, iCIFAR100, iCIFAR100LT, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR, iImageNetR_Longtail, iImageNetA, CUB, CUB_Longtail, objectnet, omnibenchmark, vtab
 
 
 class DataManager(object):

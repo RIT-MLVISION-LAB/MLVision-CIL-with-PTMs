@@ -3,6 +3,7 @@ from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
 from datasets import load_dataset
 import os
+from collections import Counter
 
 
 class iData(object):
@@ -89,56 +90,6 @@ class iCIFAR100LT(iData):
         ]
 
         self.class_order = []
-        
-    def create_head_first_inc_ordering(self, class_counts, num_head_classes=10):
-        """
-        Create custom ordering: top N head classes first, then remaining in increasing order
-        
-        Args:
-            class_counts: dict {class_id: sample_count}
-            num_head_classes: number of head classes to put first (default 10)
-        
-        Returns:
-            list: ordered class IDs
-        """
-        # Sort all classes by sample count (decreasing)
-        sorted_classes = sorted(class_counts.items(), key=lambda x: -x[1])
-        # Get the top N head classes
-        head_classes = [cls for cls, _ in sorted_classes[:num_head_classes]]
-        # Get remaining classes and sort them in increasing order
-        remaining_classes = sorted_classes[num_head_classes:]
-        tail_classes = [cls for cls, _ in sorted(remaining_classes, key=lambda x: x[1])]
-        
-        # Combine: head classes first, then increasing tail classes
-        final_order = head_classes + tail_classes
-        
-        return final_order
-    
-    def create_tail_first_dec_ordering(self, class_counts, num_tail_classes=10):
-        """
-        Create custom ordering: bottom N tail classes first, then remaining in decreasing order
-        
-        Args:
-            class_counts: dict {class_id: sample_count}
-            num_tail_classes: number of tail classes to put first (default 10)
-        
-        Returns:
-            list: ordered class IDs
-        """
-        # Sort all classes by sample count (increasing)
-        sorted_classes = sorted(class_counts.items(), key=lambda x: x[1])
-        
-        # Get the bottom N tail classes (smallest sample counts)
-        tail_classes = [cls for cls, _ in sorted_classes[:num_tail_classes]]
-        
-        # Get remaining classes and sort them in decreasing order
-        remaining_classes = sorted_classes[num_tail_classes:]
-        head_classes = [cls for cls, _ in sorted(remaining_classes, key=lambda x: -x[1])]
-        
-        # Combine: tail classes first, then decreasing head classes
-        final_order = tail_classes + head_classes
-        
-        return final_order
 
     def download_data(self):
         train_dataset = load_dataset("tomas-gajarsky/cifar100-lt", self.args["imbalance_ratio"], split="train")
@@ -157,29 +108,21 @@ class iCIFAR100LT(iData):
         if class_order_mode == "dec":
             sorted_classes = sorted(class_counts.items(), key=lambda x: -x[1])
             self.class_order = [cls for cls, _ in sorted_classes]
-            return
         elif class_order_mode == "inc":
             sorted_classes = sorted(class_counts.items(), key=lambda x: x[1])
             self.class_order = [cls for cls, _ in sorted_classes]
-            return
         elif class_order_mode == "random":
             np.random.seed(1993)
             sorted_classes = [(cls, class_counts[cls]) for cls in np.random.permutation(100)]
             self.class_order = [cls for cls, _ in sorted_classes]
-            return
         elif class_order_mode =="first":
-            self.class_order = self.create_head_first_inc_ordering(class_counts, 10)
-            return
+            self.class_order = create_head_first_inc_ordering(class_counts, 10)
         elif class_order_mode == "last":
-            self.class_order = self.create_tail_first_dec_ordering(class_counts, 10) 
-            return  
+            self.class_order = create_tail_first_dec_ordering(class_counts, 10) 
         else:
-            raise ValueError("Invalid class_order_mode: choose from ['random', 'head2tail', 'tail2head']")
-
+            raise ValueError("Invalid class_order_mode: choose from ['random', 'inc', 'dec', 'first', 'last']")
         
 
-
-        
 
 def build_transform_coda_prompt(is_train, args):
     if is_train:        
@@ -233,6 +176,7 @@ def build_transform(is_train, args):
     
     # return transforms.Compose(t)
     return t
+
 
 class iCIFAR224(iData):
     def __init__(self, args):
@@ -388,6 +332,25 @@ class iImageNetR_Longtail(iData):
 
         self.train_data, self.train_targets = self._load_txt_split(train_root_dir, train_txt)
         self.test_data, self.test_targets = self._load_txt_split(test_root_dir, test_txt)
+        
+        class_counts = Counter(self.train_targets)
+        mode = self.args.get("class_order_mode", "default")
+        
+        if mode == "dec":
+            sorted_classes = sorted(class_counts.items(), key=lambda x: -x[1])
+            self.class_order = [cls for cls, _ in sorted_classes]
+        elif mode == "inc":
+            sorted_classes = sorted(class_counts.items(), key=lambda x: x[1])
+            self.class_order = [cls for cls, _ in sorted_classes]
+        elif mode == "random":
+            np.random.seed(self.args.get("seed", 1993))
+            self.class_order = list(np.random.permutation(len(class_counts)))
+        elif mode == "first":
+            self.class_order = create_head_first_inc_ordering(class_counts, num_head_classes=20)
+        elif mode == "last":
+            self.class_order = create_tail_first_dec_ordering(class_counts, num_tail_classes=20)
+        else:
+            raise ValueError("Invalid class_order_mode: choose from ['random', 'inc', 'dec', 'first', 'last']")
 
 
 class iImageNetA(iData):
@@ -537,3 +500,52 @@ class vtab(iData):
 
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+  
+        
+def create_head_first_inc_ordering(class_counts, num_head_classes=10):
+    """
+    Create custom ordering: top N head classes first, then remaining in increasing order
+    
+    Args:
+        class_counts: dict {class_id: sample_count}
+        num_head_classes: number of head classes to put first (default 10)
+    
+    Returns:
+        list: ordered class IDs
+    """
+    # Sort all classes by sample count (decreasing)
+    sorted_classes = sorted(class_counts.items(), key=lambda x: -x[1])
+    # Get the top N head classes
+    head_classes = [cls for cls, _ in sorted_classes[:num_head_classes]]
+    # Get remaining classes and sort them in increasing order
+    remaining_classes = sorted_classes[num_head_classes:]
+    tail_classes = [cls for cls, _ in sorted(remaining_classes, key=lambda x: x[1])]
+    
+    # Combine: head classes first, then increasing tail classes
+    final_order = head_classes + tail_classes
+    return final_order
+
+def create_tail_first_dec_ordering(class_counts, num_tail_classes=10):
+    """
+    Create custom ordering: bottom N tail classes first, then remaining in decreasing order
+    
+    Args:
+        class_counts: dict {class_id: sample_count}
+        num_tail_classes: number of tail classes to put first (default 10)
+    
+    Returns:
+        list: ordered class IDs
+    """
+    # Sort all classes by sample count (increasing)
+    sorted_classes = sorted(class_counts.items(), key=lambda x: x[1])
+    
+    # Get the bottom N tail classes (smallest sample counts)
+    tail_classes = [cls for cls, _ in sorted_classes[:num_tail_classes]]
+    
+    # Get remaining classes and sort them in decreasing order
+    remaining_classes = sorted_classes[num_tail_classes:]
+    head_classes = [cls for cls, _ in sorted(remaining_classes, key=lambda x: -x[1])]
+    
+    # Combine: tail classes first, then decreasing head classes
+    final_order = tail_classes + head_classes
+    return final_order
