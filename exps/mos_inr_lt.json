@@ -36,6 +36,9 @@
     "pretrained": true,
     "drop": 0.0,
     "drop_path": 0.0,
-    "ffn_num": 16
+    "ffn_num": 16, 
+
+    "class_order_mode" : "random", 
+    "class_order_mode_choices" : ["random", "inc", "dec", "balanced", "first", "last"]
 
 }
