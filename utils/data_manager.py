@@ -3,7 +3,7 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
-from utils.data import iCIFAR10, iCIFAR100, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR, iImageNetR_Longtail, iImageNetA, CUB, CUB_Longtail, objectnet, omnibenchmark, vtab
+from utils.data import iCIFAR10, iCIFAR100, iCIFAR100LT, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR, iImageNetR_Longtail, iImageNetA, CUB, CUB_Longtail, objectnet, omnibenchmark, vtab
 
 
 class DataManager(object):
@@ -151,12 +151,14 @@ class DataManager(object):
         self._common_trsf = idata.common_trsf
 
         # Order
-        order = [i for i in range(len(np.unique(self._train_targets)))]
-        if shuffle:
-            np.random.seed(seed)
-            order = np.random.permutation(len(order)).tolist()
-        else:
+        if 'class_order_mode' in self.args and self.args['class_order_mode'] in self.args['class_order_mode_choices']:
             order = idata.class_order
+        else:
+            order = [i for i in range(len(np.unique(self._train_targets)))]
+            if shuffle:
+                np.random.seed(seed)
+                order = np.random.permutation(order).tolist()
+                
         self._class_order = order
         logging.info(self._class_order)
 
@@ -165,6 +167,8 @@ class DataManager(object):
             self._train_targets, self._class_order
         )
         self._test_targets = _map_new_class_index(self._test_targets, self._class_order)
+        
+        print(f"Final class order used in DataManager: {order}")
 
     def _select(self, x, y, low_range, high_range):
         idxes = np.where(np.logical_and(y >= low_range, y < high_range))[0]
@@ -219,6 +223,8 @@ def _get_idata(dataset_name, args=None):
         return iCIFAR10()
     elif name == "cifar100":
         return iCIFAR100()
+    elif name == "cifar100lt":
+        return iCIFAR100LT(args)
     elif name == "imagenet1000":
         return iImageNet1000()
     elif name == "imagenet100":
@@ -284,3 +290,6 @@ def default_loader(path):
         return accimage_loader(path)
     else:
         return pil_loader(path)
+    
+    
+
