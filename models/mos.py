@@ -378,9 +378,9 @@ class Learner(BaseLearner):
         class_stats = defaultdict(lambda: {
             "count": 0,
             "correct": 0,
-            "wrong_max_iter": 0,
-            "loop_list": [],
-            "wrong_adapter_ids": Counter()
+            "wrong_adapter_ids": Counter(),
+            "correct_iter_hist": Counter(),
+            "wrong_iter_hist": Counter(),
         })
 
         for _, (_, inputs, targets) in enumerate(loader):
@@ -424,12 +424,11 @@ class Learner(BaseLearner):
 
                     stat = class_stats[label]
                     stat["count"] += 1
-                    stat["loop_list"].append(loop_num)
                     if pred == label:
                         stat["correct"] += 1
+                        stat["correct_iter_hist"][loop_num] += 1
                     else:
-                        if loop_num >= MAX_ITER:
-                            stat["wrong_max_iter"] += 1
+                        stat["wrong_iter_hist"][loop_num] += 1
                         stat["wrong_adapter_ids"][prev_adapter_idx.item()] += 1
 
                 final_logits = torch.cat(final_logits, dim=0).to(self._device)
@@ -453,29 +452,33 @@ class Learner(BaseLearner):
         logging.info("the accuracy of the original model:{}".format(np.around(orig_acc, 2)))
 
         # logging class-wise refinement statistics
-        print(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14} {'WrongAdapters':<20}")
-        print("-" * 90)
-        logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14} {'WrongAdapters':<20}")
-        logging.info("-" * 90)
+        print(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'CorrectIterHist':<35} {'WrongIterHist':<35} {'WrongAdapters':<20}")
+        print("-" * 160)
+        logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'CorrectIterHist':<35} {'WrongIterHist':<35} {'WrongAdapters':<20}")
+        logging.info("-" * 160)
         for cls in sorted(class_stats.keys()):
             entry = class_stats[cls]
             acc = 100 * entry["correct"] / entry["count"] if entry["count"] > 0 else 0
-            avg_iter = np.mean(entry["loop_list"])
+            correct_hist = dict(entry["correct_iter_hist"])
+            wrong_hist = dict(entry["wrong_iter_hist"])
             wrong_adapter_summary = dict(entry["wrong_adapter_ids"])
-            print(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14} {wrong_adapter_summary}")
-            logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14} {wrong_adapter_summary}")
+
+            print(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {str(correct_hist):<35} {str(wrong_hist):<35} {str(wrong_adapter_summary):<20}")
+            logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {str(correct_hist):<35} {str(wrong_hist):<35} {str(wrong_adapter_summary):<20}")
 
         y_pred_flat = np.concatenate(y_pred)[:, 0]  # Take top-1 prediction
         y_true_flat = np.concatenate(y_true)
         cm = confusion_matrix(y_true_flat, y_pred_flat, labels=np.arange(self._total_classes))
 
         init_cls = 0 if self.args ["init_cls"] == self.args["increment"] else self.args["init_cls"]
+        class_order_mode = self.args.get("class_order_mode", "random")
         logs_dir = os.path.join(
             "logs",
             self.args["model_name"],
             self.args["dataset"],
             str(init_cls),
             str(self.args["increment"]),
+            class_order_mode,
             "confusions"
         )
         os.makedirs(logs_dir, exist_ok=True)

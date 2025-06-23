@@ -3,6 +3,7 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from collections import Counter
 from utils.data import iCIFAR10, iCIFAR100, iCIFAR100LT, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR, iImageNetR_Longtail, iImageNetA, CUB, CUB_Longtail, objectnet, omnibenchmark, vtab
 
 
@@ -160,15 +161,16 @@ class DataManager(object):
                 order = np.random.permutation(order).tolist()
                 
         self._class_order = order
-        logging.info(self._class_order)
+
+        class_order_histogram = {cls: Counter(self._train_targets)[cls] for cls in self._class_order}
+        logging.info("Class order distribution: {}".format(class_order_histogram))
+        print(f"Class order distribution: {class_order_histogram}")
 
         # Map indices
         self._train_targets = _map_new_class_index(
             self._train_targets, self._class_order
         )
         self._test_targets = _map_new_class_index(self._test_targets, self._class_order)
-        
-        print(f"Final class order used in DataManager: {order}")
 
     def _select(self, x, y, low_range, high_range):
         idxes = np.where(np.logical_and(y >= low_range, y < high_range))[0]
@@ -238,9 +240,9 @@ def _get_idata(dataset_name, args=None):
     elif name == "imageneta":
         return iImageNetA()
     elif name == "cub":
-        return CUB()
+        return CUB(args)
     elif name == "cub_lt":
-        return CUB_Longtail()
+        return CUB_Longtail(args)
     elif name == "objectnet":
         return objectnet()
     elif name == "omnibenchmark":
