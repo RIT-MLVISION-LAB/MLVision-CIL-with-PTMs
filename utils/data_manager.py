@@ -4,7 +4,24 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 from collections import Counter
-from utils.data import iCIFAR10, iCIFAR100, iCIFAR100LT, iImageNet100, iImageNet1000, iCIFAR224, iImageNetR, iImageNetR_Longtail, iImageNetA, CUB, CUB_Longtail, objectnet, omnibenchmark, vtab
+from utils.data import (
+    iCIFAR10,
+    iCIFAR100,
+    iCIFAR100LT,
+    iImageNet100,
+    iImageNet1000,
+    iCIFAR224,
+    iImageNetR,
+    iImageNetR_Longtail,
+    iImageNetA,
+    iImageNetA_Longtail,
+    CUB,
+    CUB_Longtail,
+    objectnet,
+    objectnet_Longtail,
+    omnibenchmark,
+    vtab,
+)
 
 
 class DataManager(object):
@@ -238,13 +255,17 @@ def _get_idata(dataset_name, args=None):
     elif name == "imagenetr_lt":
         return iImageNetR_Longtail(args)
     elif name == "imageneta":
-        return iImageNetA()
+        return iImageNetA(args)
+    elif name == "imageneta_lt":
+        return iImageNetA_Longtail(args)
     elif name == "cub":
         return CUB(args)
     elif name == "cub_lt":
         return CUB_Longtail(args)
     elif name == "objectnet":
-        return objectnet()
+        return objectnet(args)
+    elif name == "objectnet_lt":
+        return objectnet_Longtail(args)
     elif name == "omnibenchmark":
         return omnibenchmark()
     elif name == "vtab":
@@ -292,6 +313,3 @@ def default_loader(path):
         return accimage_loader(path)
     else:
         return pil_loader(path)
-    
-    
-

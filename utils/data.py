@@ -365,7 +365,7 @@ class iImageNetR_Longtail(iData):
             self.test_trsf = build_transform(False, args)
         self.common_trsf = []
 
-        self.class_order = np.arange(200).tolist()  # sorted label IDs (0–199)
+        self.class_order = np.arange(200).tolist()
 
     def download_data(self):
         root_dir = os.getenv("IMAGENETR_ROOT")
@@ -390,24 +390,70 @@ class iImageNetR_Longtail(iData):
 
 
 class iImageNetA(iData):
-    use_path = True
-    
-    train_trsf = build_transform(True, None)
-    test_trsf = build_transform(False, None)
-    common_trsf = [    ]
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.use_path = True
 
-    class_order = np.arange(200).tolist()
+        if args["model_name"] == "coda_prompt":
+            self.train_trsf = build_transform_coda_prompt(True, args)
+            self.test_trsf = build_transform_coda_prompt(False, args)
+        else:
+            self.train_trsf = build_transform(True, args)
+            self.test_trsf = build_transform(False, args)
+        self.common_trsf = [    ]
+
+        self.class_order = np.arange(200).tolist()
 
     def download_data(self):
         # assert 0, "You should specify the folder of your dataset"
-        train_dir = "./data/imagenet-a/train/"
-        test_dir = "./data/imagenet-a/test/"
+        root_dir = os.getenv("IMAGENETA_ROOT")
+        train_dir = os.path.join(root_dir, "train")
+        test_dir = os.path.join(root_dir, "test")
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
 
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+
+class iImageNetA_Longtail(iData):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.use_path = True
+
+        if args["model_name"] == "coda_prompt":
+            self.train_trsf = build_transform_coda_prompt(True, args)
+            self.test_trsf = build_transform_coda_prompt(False, args)
+        else:
+            self.train_trsf = build_transform(True, args)
+            self.test_trsf = build_transform(False, args)
+        self.common_trsf = []
+
+        self.class_order = np.arange(200).tolist()
+
+    def download_data(self):
+        root_dir = os.getenv("IMAGENETA_ROOT")
+        train_root_dir = os.path.join(root_dir, "train")
+        test_root_dir = os.path.join(root_dir, "test")
+        splits_dir = os.path.join(root_dir, "splits")
+
+        train_split = os.path.join(splits_dir, "train_longtail.txt")
+        test_split = os.path.join(splits_dir, "test.txt")
+
+        self.train_data, self.train_targets = load_split(train_root_dir, train_split)
+        self.test_data, self.test_targets = load_split(test_root_dir, test_split)
+        
+        class_counts = Counter(self.train_targets)
+        class_order_mode = self.args.get("class_order_mode", "random")
+        num_extreme_classes = (
+            self.args.get("init_cls", 10)
+            if self.args["init_cls"] == self.args["increment"]
+            else self.args["init_cls"]
+        )
+        self.class_order = self.get_class_order(class_order_mode, class_counts, num_extreme_classes)
 
 
 class CUB(iData):
@@ -473,24 +519,70 @@ class CUB_Longtail(iData):
 
 
 class objectnet(iData):
-    use_path = True
-    
-    train_trsf = build_transform(True, None)
-    test_trsf = build_transform(False, None)
-    common_trsf = [    ]
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.use_path = True
 
-    class_order = np.arange(200).tolist()
+        if args["model_name"] == "coda_prompt":
+            self.train_trsf = build_transform_coda_prompt(True, args)
+            self.test_trsf = build_transform_coda_prompt(False, args)
+        else:
+            self.train_trsf = build_transform(True, args)
+            self.test_trsf = build_transform(False, args)
+        self.common_trsf = [    ]
+
+        self.class_order = np.arange(200).tolist()
 
     def download_data(self):
         # assert 0, "You should specify the folder of your dataset"
-        train_dir = "./data/objectnet/train/"
-        test_dir = "./data/objectnet/test/"
+        root_dir = os.getenv("OBJECTNET_ROOT")
+        train_dir = os.path.join(root_dir, "train")
+        test_dir = os.path.join(root_dir, "test")
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
 
         self.train_data, self.train_targets = split_images_labels(train_dset.imgs)
         self.test_data, self.test_targets = split_images_labels(test_dset.imgs)
+
+
+class objectnet_Longtail(iData):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.use_path = True
+
+        if args["model_name"] == "coda_prompt":
+            self.train_trsf = build_transform_coda_prompt(True, args)
+            self.test_trsf = build_transform_coda_prompt(False, args)
+        else:
+            self.train_trsf = build_transform(True, args)
+            self.test_trsf = build_transform(False, args)
+        self.common_trsf = []
+
+        self.class_order = np.arange(200).tolist()
+
+    def download_data(self):
+        root_dir = os.getenv("OBJECTNET_ROOT")
+        train_root_dir = os.path.join(root_dir, "train")
+        test_root_dir = os.path.join(root_dir, "test")
+        splits_dir = os.path.join(root_dir, "splits")
+
+        train_split = os.path.join(splits_dir, "train_longtail.txt")
+        test_split = os.path.join(splits_dir, "test.txt")
+
+        self.train_data, self.train_targets = load_split(train_root_dir, train_split)
+        self.test_data, self.test_targets = load_split(test_root_dir, test_split)
+
+        class_counts = Counter(self.train_targets)
+        class_order_mode = self.args.get("class_order_mode", "random")
+        num_extreme_classes = (
+            self.args.get("init_cls", 10)
+            if self.args["init_cls"] == self.args["increment"]
+            else self.args["init_cls"]
+        )
+        self.class_order = self.get_class_order(class_order_mode, class_counts, num_extreme_classes)
 
 
 class omnibenchmark(iData):
