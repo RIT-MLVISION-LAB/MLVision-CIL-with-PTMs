@@ -13,6 +13,8 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 from collections import defaultdict, Counter
 from sklearn.metrics import confusion_matrix
 import os
+from collections import defaultdict
+from utils.losses import FocalLoss, CELoss, LDAMLoss, BalancedSoftmaxLoss
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
@@ -151,10 +153,54 @@ class Learner(BaseLearner):
 
         return scheduler
 
-    def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+    def _init_train_old(self, train_loader, test_loader, optimizer, scheduler):
         prog_bar = tqdm(range(self.args['tuned_epoch']))
+        loss_type = self.args.get("loss_type", "ce")
+        logging.info(f"Using loss_type: {loss_type}")
+        
+        # Compute class counts from training labels
+        
+        cur_classes = np.arange(self._known_classes, self._total_classes)
+        labels = np.array(self.train_dataset.labels)
+        class_counts = np.bincount(labels, minlength=self._total_classes)
+        class_counts = torch.tensor(class_counts, dtype=torch.float32, device=self._device)
+        
+        class_counts[:self._known_classes] = 0 # to ignore known classes in the loss computation
+
+        # Compute CB-loss weights
+        beta = 0.9999
+        effective_num = 1.0 - torch.pow(beta, class_counts)
+        weights = (1.0 - beta) / effective_num
+        weights[class_counts == 0] = 0  # zero weight for old classes
+        weights = weights / weights.sum() * len(cur_classes)
+        
+        if loss_type == "ce":
+            criterion = nn.CrossEntropyLoss()
+
+        elif loss_type == "cb":
+            criterion = CELoss(weight=weights)
+        elif loss_type == "balanced_softmax":
+            criterion = BalancedSoftmaxLoss(class_counts=torch.tensor(safe_class_counts, device=self._device))
+
+        elif loss_type == "focal":
+            gamma = self.args.get("focal_gamma", 1.5)
+            criterion = FocalLoss(weight=weights, gamma=gamma)
+
+        elif loss_type == "ldam":
+            max_m = self.args.get("ldam_max_m", 0.5)
+            s = self.args.get("ldam_s", 30)
+            safe_class_counts = class_counts.clone()
+            safe_class_counts[safe_class_counts == 0] = 1.0
+            criterion = LDAMLoss(cls_num_list=safe_class_counts.tolist(), max_m=max_m, weight=weights, s=s)
+
+            #criterion = LDAMLoss(cls_num_list=class_counts.tolist(), max_m=max_m, weight=weights, s=s)
+
+        else:
+            raise ValueError(f"Unknown loss_type: {loss_type}")
+        
         for _, epoch in enumerate(prog_bar):
             self._network.backbone.train()
+            
 
             losses = 0.0
             correct, total = 0, 0
@@ -165,7 +211,8 @@ class Learner(BaseLearner):
                 logits = output["logits"][:, :self._total_classes]
                 logits[:, :self._known_classes] = float('-inf')
 
-                loss = F.cross_entropy(logits, targets.long())
+                #loss = F.cross_entropy(logits, targets.long())
+                loss = criterion(logits, targets).mean()
                 loss += self.orth_loss(output['pre_logits'], targets)
 
                 optimizer.zero_grad()
@@ -195,6 +242,104 @@ class Learner(BaseLearner):
             )
             prog_bar.set_description(info)
 
+        logging.info(info)
+        
+        
+    def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+        prog_bar = tqdm(range(self.args['tuned_epoch']))
+
+        # === Compute class counts for this task ===
+        labels = np.array(self.train_dataset.labels)
+        class_counts = np.bincount(labels, minlength=self._total_classes)
+
+        def is_long_tail(class_counts, threshold=15):
+            counts = class_counts[class_counts > 0]
+            if len(counts) == 0:
+                return False
+            return counts.max() / (counts.min() + 1e-5) > threshold
+
+        has_imbalance = is_long_tail(class_counts)
+        imb_ratio = class_counts.max() / (class_counts[class_counts > 0].min() + 1e-5)
+        print(f"Imbalance ratio for Task {self._cur_task}: {imb_ratio:.2f}")
+
+        total_epochs = self.args['tuned_epoch']
+
+        # === Precompute CB weights if needed ===
+        if has_imbalance:
+            beta = 0.9999
+            effective_num = 1.0 - np.power(beta, class_counts)
+            weights = (1.0 - beta) / (effective_num + 1e-8)
+            weights[class_counts == 0] = 0
+            active = class_counts > 0
+            weights = weights / weights[active].sum() * active.sum()
+            weights = torch.tensor(weights, dtype=torch.float32, device=self._device)
+        else:
+            weights = None
+
+        safe_class_counts = class_counts.copy()
+        safe_class_counts[safe_class_counts == 0] = 1
+
+        for epoch in prog_bar:
+            self._network.backbone.train()
+
+            # === DRW: choose loss dynamically ===
+            if not has_imbalance or epoch < total_epochs // 2:
+                criterion = nn.CrossEntropyLoss()
+                if epoch == 0:
+                    print("DRW: Using CE during warm-up phase")
+            else:
+                loss_type = self.args.get("loss_type", "cb")  # fallback
+                print(f"DRW: Using imbalance-aware loss: {loss_type}")
+
+                if loss_type == "cb":
+                    criterion = CELoss(weight=weights)
+                elif loss_type == "focal":
+                    gamma = self.args.get("focal_gamma", 1.5)
+                    criterion = FocalLoss(weight=weights, gamma=gamma)
+                elif loss_type == "ldam":
+                    max_m = self.args.get("ldam_max_m", 0.5)
+                    s = self.args.get("ldam_s", 30)
+                    criterion = LDAMLoss(cls_num_list=safe_class_counts.tolist(), max_m=max_m, weight=weights, s=s)
+                elif loss_type == "balanced_softmax":
+                    criterion = BalancedSoftmaxLoss(class_counts=torch.tensor(safe_class_counts, device=self._device))
+                else:
+                    raise ValueError(f"Unknown loss_type: {loss_type}")
+
+            losses = 0.0
+            correct, total = 0, 0
+
+            for _, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self._device), targets.to(self._device)
+
+                output = self._network(inputs, adapter_id=self._cur_task, train=True)
+                logits = output["logits"][:, :self._total_classes]
+                logits[:, :self._known_classes] = float('-inf')
+
+                loss = criterion(logits, targets).mean()
+                loss += self.orth_loss(output['pre_logits'], targets)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                if self.args.get("adapter_momentum", 0) > 0:
+                    self._network.backbone.adapter_merge()
+
+                losses += loss.item()
+                _, preds = torch.max(logits, dim=1)
+                correct += preds.eq(targets).cpu().sum()
+                total += len(targets)
+
+            if scheduler:
+                scheduler.step()
+
+            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+            info = (
+                f"Task {self._cur_task}, Epoch {epoch+1}/{total_epochs} "
+                f"=> Loss {losses/len(train_loader):.3f}, Train_acc {train_acc:.2f}, "
+                f"Imb_ratio: {imb_ratio:.2f}"
+            )
+            prog_bar.set_description(info)
         logging.info(info)
         
     @torch.no_grad()
@@ -486,3 +631,129 @@ class Learner(BaseLearner):
         np.save(cm_save_path, cm)
 
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]
+    
+    
+    
+    def _eval_cnn_imb(self, loader):
+        self._network.eval()
+        y_pred, y_true = [], []
+        orig_y_pred = []
+        MAX_ITER = 4
+        class_stats = defaultdict(lambda: {
+            "count": 0,
+            "correct": 0,
+            "wrong_max_iter": 0,
+            "loop_list": []
+        })
+
+        for _, (_, inputs, targets) in enumerate(loader):
+            inputs = inputs.to(self._device)
+            with torch.no_grad():
+                orig_logits = self._network.forward_orig(inputs)["logits"][:, :self._total_classes]
+                orig_preds = torch.max(orig_logits, dim=1)[1].cpu().numpy()
+                orig_idx = torch.tensor([self.cls2task[v] for v in orig_preds], device=self._device)
+            
+                orig_y_pred.append(orig_preds.reshape(-1))
+                
+                all_features = torch.zeros(len(inputs), self._cur_task + 1, self._network.backbone.out_dim, device=self._device)
+                for t_id in range(self._cur_task + 1):
+                    t_features = self._network.backbone(inputs, adapter_id=t_id, train=False)["features"]
+                    all_features[:, t_id, :] = t_features
+                
+                final_logits = []
+                
+                for x_id in range(len(inputs)):
+                    loop_num = 0
+                    prev_adapter_idx = orig_idx[x_id]
+                    while True:
+                        loop_num += 1
+                        cur_feature = all_features[x_id, prev_adapter_idx].unsqueeze(0)
+                        cur_logits = self._network.backbone(cur_feature, fc_only=True)["logits"][:, :self._total_classes]
+                        cur_pred = torch.max(cur_logits, dim=1)[1].cpu().numpy()
+                        cur_adapter_idx = torch.tensor([self.cls2task[v] for v in cur_pred], device=self._device)[0]
+                        
+                        if loop_num >= MAX_ITER or cur_adapter_idx == prev_adapter_idx:
+                            break
+                        else:
+                            prev_adapter_idx = cur_adapter_idx
+                        
+                    final_logits.append(cur_logits)
+
+                    label = targets[x_id].item()
+                    pred = cur_pred[0]
+
+                    stat = class_stats[label]
+                    stat["count"] += 1
+                    stat["loop_list"].append(loop_num)
+                    if pred == label:
+                        stat["correct"] += 1
+                    else:
+                        if loop_num >= MAX_ITER:
+                            stat["wrong_max_iter"] += 1
+
+                final_logits = torch.cat(final_logits, dim=0).to(self._device)
+
+                if self.ensemble:
+                    final_logits = F.softmax(final_logits, dim=1)
+                    orig_logits = F.softmax(orig_logits / (1/(self._cur_task+1)), dim=1)
+                    outputs = final_logits + orig_logits
+                else:
+                    outputs = final_logits
+                
+            predicts = torch.topk(
+                outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]
+            y_pred.append(predicts.cpu().numpy())
+            y_true.append(targets.cpu().numpy())
+            
+        # === Original acc (overall) ===
+        orig_acc = (np.concatenate(orig_y_pred) == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
+        logging.info("the accuracy of the original model:{}".format(np.around(orig_acc, 2)))
+
+        print(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14}")
+        print("-" * 60)
+        logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'AvgIter':<8} {'MaxIterWrong':<14}")
+        logging.info("-" * 60)
+        for cls in sorted(class_stats.keys()):
+            entry = class_stats[cls]
+            acc = 100 * entry["correct"] / entry["count"] if entry["count"] > 0 else 0
+            avg_iter = np.mean(entry["loop_list"])
+            print(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14}")
+            logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {avg_iter:<8.2f} {entry['wrong_max_iter']:<14}")
+        
+        # === Head/Mid/Tail acc ===
+        labels = np.array(self.train_dataset.labels)
+        class_counts = np.bincount(labels, minlength=self._total_classes)
+
+        counts = class_counts.copy()
+
+        head_cls = np.where(counts > 100)[0]
+        mid_cls  = np.where((counts >= 20) & (counts <= 100))[0]
+        tail_cls = np.where(counts < 20)[0]
+
+        print(f"Head classes: {head_cls.tolist()}")
+        print(f"Mid classes: {mid_cls.tolist()}")›
+        print(f"Tail classes: {tail_cls.tolist()}")
+        
+        y_pred_ = np.concatenate(y_pred)[:, 0]  # top-1
+        y_true_ = np.concatenate(y_true)
+
+        head_mask = np.isin(y_true_, head_cls)
+        mid_mask = np.isin(y_true_, mid_cls)
+        tail_mask = np.isin(y_true_, tail_cls)
+
+        head_acc = (y_pred_[head_mask] == y_true_[head_mask]).mean() * 100 if np.sum(head_mask) > 0 else 0
+        mid_acc = (y_pred_[mid_mask] == y_true_[mid_mask]).mean() * 100 if np.sum(mid_mask) > 0 else 0
+        tail_acc = (y_pred_[tail_mask] == y_true_[tail_mask]).mean() * 100 if np.sum(tail_mask) > 0 else 0
+
+        print(f"Head Acc: {head_acc:.2f}, Mid Acc: {mid_acc:.2f}, Tail Acc: {tail_acc:.2f}")
+        logging.info(f"Head Acc: {head_acc:.2f}, Mid Acc: {mid_acc:.2f}, Tail Acc: {tail_acc:.2f}")    
+
+        return np.concatenate(y_pred), np.concatenate(y_true), head_acc, mid_acc, tail_acc
+    
+    
+    def is_long_tail(class_counts, threshold=1.5):
+        counts = class_counts[class_counts > 0]
+        if len(counts) == 0:
+            return False
+        return counts.max() / (counts.min() + 1e-5) > threshold
+

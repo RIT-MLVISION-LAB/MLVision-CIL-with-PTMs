@@ -40,6 +40,9 @@
     "class_order_mode" : "random", 
     "class_order_mode_choices" : ["random", "inc", "dec", "balanced", "first", "last"],
     "imbalance_ratio":"r-100",
-    "imbalance_ratio_choices": ["r-100", "r-50", "r-10" ]
+    "imbalance_ratio_choices": ["r-100", "r-50", "r-10" ],
+
+    "loss_type" : "ldam",
+    "loss_type_choices": ["ce", "focal", "ldam", "cb"]
 
 }

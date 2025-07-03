@@ -368,7 +368,8 @@ class iImageNetR_Longtail(iData):
         self.class_order = np.arange(200).tolist()
 
     def download_data(self):
-        root_dir = os.getenv("IMAGENETR_ROOT")
+        #root_dir = os.getenv("IMAGENETR_ROOT")
+        root_dir = "/home/aa5264/Desktop/Lamda-Pilot/MLVision-CIL-with-PTMs/data/imagenet-r/"
         train_root_dir = os.path.join(root_dir, "train")
         test_root_dir = os.path.join(root_dir, "test")
         splits_dir = os.path.join(root_dir, "splits")

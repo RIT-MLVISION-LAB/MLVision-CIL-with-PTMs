@@ -9,7 +9,7 @@
     "increment": 20,
     "model_name": "mos",
     "backbone_type": "vit_base_patch16_224_mos",
-    "device": ["0"],
+    "device": ["3"],
     "seed": [1993],
     
     "tuned_epoch": 20,
@@ -41,7 +41,12 @@
     "class_order_mode" : "random", 
     "class_order_mode_choices" : ["random", "inc", "dec", "balanced", "first", "last"],
 
-    "loss_type" : "ce",
-    "loss_type_choices": ["ce", "focal", "ldam", "cb"]
+    "loss_type" : "focal",
+    "loss_type_choices": ["ce", "focal", "ldam", "cb"],
+    "focal_gamma": 1.5
+
+
+
+    
 
 }

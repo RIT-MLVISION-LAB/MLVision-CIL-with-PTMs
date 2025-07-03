@@ -73,8 +73,17 @@ def _train(args):
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
         model.incremental_train(data_manager)
-        cnn_accy, nme_accy = model.eval_task()
+        cnn_accy, nme_accy, head_acc, mid_acc, tail_acc = model.eval_task()
         model.after_task()
+        
+        
+        logging.info("Head Accuracy: {:.2f}".format(head_acc))
+        logging.info("Mid Accuracy: {:.2f}".format(mid_acc))
+        logging.info("Tail Accuracy: {:.2f}".format(tail_acc))
+
+        print("Head Accuracy: {:.2f}".format(head_acc))
+        print("Mid Accuracy: {:.2f}".format(mid_acc))
+        print("Tail Accuracy: {:.2f}".format(tail_acc))
 
         if nme_accy is not None:
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
@@ -170,3 +179,4 @@ def _set_random(seed=1):
 def print_args(args):
     for key, value in args.items():
         logging.info("{}: {}".format(key, value))
+        
