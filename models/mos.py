@@ -10,7 +10,9 @@ from utils.inc_net import MOSNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy, target2onehot
 from torch.distributions.multivariate_normal import MultivariateNormal
-
+from collections import defaultdict, Counter
+from sklearn.metrics import confusion_matrix
+import os
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
@@ -244,6 +246,19 @@ class Learner(BaseLearner):
                 self.cls_mean[class_idx] = cluster_means
                 self.cls_cov[class_idx] = cluster_vars
 
+    @staticmethod
+    def ensure_positive_definite(cov, epsilon=1e-4, max_attempts=5):
+        identity = torch.eye(cov.size(0), device=cov.device)
+        for _ in range(max_attempts):
+            try:
+                torch.linalg.cholesky(cov + epsilon * identity)
+                return cov + epsilon * identity
+            except RuntimeError:
+                epsilon *= 10
+
+        diag = torch.clamp(torch.diag(cov), min=1e-3)   # fallback: force diagonal
+        return torch.diag(diag)
+
     def classifer_align(self, model):
         model.train()
         
@@ -266,6 +281,7 @@ class Learner(BaseLearner):
                     cov = self.cls_cov[class_idx].to(self._device)
                     if self.args["ca_storage_efficient_method"] == 'variance':
                         cov = torch.diag(cov)
+                    cov = self.ensure_positive_definite(cov)
                     m = MultivariateNormal(mean.float(), cov.float())
                     sampled_data_single = m.sample(sample_shape=(num_sampled_pcls,))
                     sampled_data.append(sampled_data_single)
@@ -358,6 +374,15 @@ class Learner(BaseLearner):
         self._network.eval()
         y_pred, y_true = [], []
         orig_y_pred = []
+        MAX_ITER = 4
+        class_stats = defaultdict(lambda: {
+            "count": 0,
+            "correct": 0,
+            "wrong_adapter_ids": Counter(),
+            "correct_iter_hist": Counter(),
+            "wrong_iter_hist": Counter(),
+        })
+
         for _, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
             with torch.no_grad():
@@ -376,7 +401,6 @@ class Learner(BaseLearner):
                 # self-refined
                 final_logits = []
                 
-                MAX_ITER = 4
                 for x_id in range(len(inputs)):
                     loop_num = 0
                     prev_adapter_idx = orig_idx[x_id]
@@ -393,6 +417,20 @@ class Learner(BaseLearner):
                             prev_adapter_idx = cur_adapter_idx
                         
                     final_logits.append(cur_logits)
+
+                    # logging refinement statistics
+                    label = targets[x_id].item()
+                    pred = cur_pred[0]
+
+                    stat = class_stats[label]
+                    stat["count"] += 1
+                    if pred == label:
+                        stat["correct"] += 1
+                        stat["correct_iter_hist"][loop_num] += 1
+                    else:
+                        stat["wrong_iter_hist"][loop_num] += 1
+                        stat["wrong_adapter_ids"][prev_adapter_idx.item()] += 1
+
                 final_logits = torch.cat(final_logits, dim=0).to(self._device)
 
                 if self.ensemble:
@@ -412,4 +450,39 @@ class Learner(BaseLearner):
 
         orig_acc = (np.concatenate(orig_y_pred) == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
         logging.info("the accuracy of the original model:{}".format(np.around(orig_acc, 2)))
+
+        # logging class-wise refinement statistics
+        print(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'CorrectIterHist':<35} {'WrongIterHist':<35} {'WrongAdapters':<20}")
+        print("-" * 160)
+        logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'CorrectIterHist':<35} {'WrongIterHist':<35} {'WrongAdapters':<20}")
+        logging.info("-" * 160)
+        for cls in sorted(class_stats.keys()):
+            entry = class_stats[cls]
+            acc = 100 * entry["correct"] / entry["count"] if entry["count"] > 0 else 0
+            correct_hist = dict(entry["correct_iter_hist"])
+            wrong_hist = dict(entry["wrong_iter_hist"])
+            wrong_adapter_summary = dict(entry["wrong_adapter_ids"])
+
+            print(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {str(correct_hist):<35} {str(wrong_hist):<35} {str(wrong_adapter_summary):<20}")
+            logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {str(correct_hist):<35} {str(wrong_hist):<35} {str(wrong_adapter_summary):<20}")
+
+        y_pred_flat = np.concatenate(y_pred)[:, 0]  # Take top-1 prediction
+        y_true_flat = np.concatenate(y_true)
+        cm = confusion_matrix(y_true_flat, y_pred_flat, labels=np.arange(self._total_classes))
+
+        init_cls = 0 if self.args ["init_cls"] == self.args["increment"] else self.args["init_cls"]
+        class_order_mode = self.args.get("class_order_mode", "random")
+        logs_dir = os.path.join(
+            "logs",
+            self.args["model_name"],
+            self.args["dataset"],
+            str(init_cls),
+            str(self.args["increment"]),
+            class_order_mode,
+            "confusions"
+        )
+        os.makedirs(logs_dir, exist_ok=True)
+        cm_save_path = os.path.join(logs_dir, f"cm_task_{self._cur_task}.npy")
+        np.save(cm_save_path, cm)
+
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]

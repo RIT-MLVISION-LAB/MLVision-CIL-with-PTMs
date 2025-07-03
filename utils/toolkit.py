@@ -85,6 +85,16 @@ def split_images_labels(imgs):
 
     return np.array(images), np.array(labels)
 
+def load_split(root_dir, split_file):
+        data, targets = [], []
+        with open(split_file, 'r') as f:
+            for line in f:
+                path, label = line.strip().split()
+                full_path = os.path.join(root_dir, path)
+                data.append(full_path)
+                targets.append(int(label))
+        return np.array(data), np.array(targets)
+
 def state_dict_to_vector(state_dict, remove_keys=[]) -> torch.Tensor:
     shared_state_dict = copy.deepcopy(state_dict)
     shared_state_dict_keys = list(shared_state_dict.keys())
