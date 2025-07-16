@@ -1,5 +1,6 @@
 data/
 logs/
+logs-old/
 .idea/
 __pycache__/
 *.py[cod]

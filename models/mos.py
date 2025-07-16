@@ -488,12 +488,13 @@ class Learner(BaseLearner):
             thresholds = LONGTAIL_SPLIT_SPEC[self.args["dataset"]]
             head_threshold = thresholds["head_threshold"]
             tail_threshold = thresholds["tail_threshold"]
-            train_class_counts = Counter(self.train_dataset.labels)
-            sorted_class_counts = sorted(train_class_counts.items(), key=lambda x: x[0])
+            current_train_class_counts = Counter(self.train_dataset.labels)
+            self._known_classes_histogram.update(current_train_class_counts)
+            all_train_class_counts = self._known_classes_histogram
 
-            head_classes = {cls for cls, count in sorted_class_counts if count > head_threshold}
-            tail_classes = {cls for cls, count in sorted_class_counts if count < tail_threshold}
-            mid_classes = set(train_class_counts.keys()) - head_classes - tail_classes
+            head_classes = {cls for cls, count in all_train_class_counts.items() if count > head_threshold}
+            tail_classes = {cls for cls, count in all_train_class_counts.items() if count < tail_threshold}
+            mid_classes = set(all_train_class_counts.keys()) - head_classes - tail_classes
 
             head_accs, mid_accs, tail_accs = [], [], []
 
