@@ -1,6 +1,7 @@
 import logging
 import numpy as np
 import torch
+import os
 from torch import nn
 from tqdm import tqdm
 from torch import optim
@@ -12,7 +13,7 @@ from utils.toolkit import tensor2numpy, target2onehot
 from torch.distributions.multivariate_normal import MultivariateNormal
 from collections import defaultdict, Counter
 from sklearn.metrics import confusion_matrix
-import os
+from utils.longtail_split_specs import LONGTAIL_SPLIT_SPEC
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
@@ -452,8 +453,6 @@ class Learner(BaseLearner):
         logging.info("the accuracy of the original model:{}".format(np.around(orig_acc, 2)))
 
         # logging class-wise refinement statistics
-        print(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'CorrectIterHist':<35} {'WrongIterHist':<35} {'WrongAdapters':<20}")
-        print("-" * 160)
         logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'CorrectIterHist':<35} {'WrongIterHist':<35} {'WrongAdapters':<20}")
         logging.info("-" * 160)
         for cls in sorted(class_stats.keys()):
@@ -463,7 +462,6 @@ class Learner(BaseLearner):
             wrong_hist = dict(entry["wrong_iter_hist"])
             wrong_adapter_summary = dict(entry["wrong_adapter_ids"])
 
-            print(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {str(correct_hist):<35} {str(wrong_hist):<35} {str(wrong_adapter_summary):<20}")
             logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {str(correct_hist):<35} {str(wrong_hist):<35} {str(wrong_adapter_summary):<20}")
 
         y_pred_flat = np.concatenate(y_pred)[:, 0]  # Take top-1 prediction
@@ -484,5 +482,38 @@ class Learner(BaseLearner):
         os.makedirs(logs_dir, exist_ok=True)
         cm_save_path = os.path.join(logs_dir, f"cm_task_{self._cur_task}.npy")
         np.save(cm_save_path, cm)
+
+        # logging long-tail accuracies
+        if "lt" in self.args["dataset"] and self.args["dataset"] in LONGTAIL_SPLIT_SPEC:
+            thresholds = LONGTAIL_SPLIT_SPEC[self.args["dataset"]]
+            head_threshold = thresholds["head_threshold"]
+            tail_threshold = thresholds["tail_threshold"]
+            current_train_class_counts = Counter(self.train_dataset.labels)
+            self._known_classes_histogram.update(current_train_class_counts)
+            all_train_class_counts = self._known_classes_histogram
+
+            head_classes = {cls for cls, count in all_train_class_counts.items() if count > head_threshold}
+            tail_classes = {cls for cls, count in all_train_class_counts.items() if count < tail_threshold}
+            mid_classes = set(all_train_class_counts.keys()) - head_classes - tail_classes
+
+            head_accs, mid_accs, tail_accs = [], [], []
+
+            for cls, stats in class_stats.items():
+                n = stats["count"]
+                acc = 100 * stats["correct"] / n if n > 0 else 0
+                if cls in head_classes:
+                    head_accs.append(acc)
+                elif cls in tail_classes:
+                    tail_accs.append(acc)
+                elif cls in mid_classes:
+                    mid_accs.append(acc)
+
+            head_avg = np.mean(head_accs) if head_accs else 0.0
+            mid_avg = np.mean(mid_accs) if mid_accs else 0.0
+            tail_avg = np.mean(tail_accs) if tail_accs else 0.0
+
+            logging.info(f"[Task {self._cur_task}] Head-Class Accuracy: {head_avg:.2f}")
+            logging.info(f"[Task {self._cur_task}] Mid-Class Accuracy: {mid_avg:.2f}")
+            logging.info(f"[Task {self._cur_task}] Tail-Class Accuracy: {tail_avg:.2f}")
 
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]

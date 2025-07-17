@@ -181,7 +181,6 @@ class DataManager(object):
 
         class_order_histogram = {cls: Counter(self._train_targets)[cls] for cls in self._class_order}
         logging.info("Class order distribution: {}".format(class_order_histogram))
-        print(f"Class order distribution: {class_order_histogram}")
 
         # Map indices
         self._train_targets = _map_new_class_index(

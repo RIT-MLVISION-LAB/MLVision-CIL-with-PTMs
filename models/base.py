@@ -26,6 +26,7 @@ class BaseLearner(object):
         self._device = args["device"][0]
         self._multiple_gpus = args["device"]
         self.args = args
+        self._known_classes_histogram = {}
 
     @property
     def exemplar_size(self):
