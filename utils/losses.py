@@ -83,3 +83,32 @@ class LDAMLoss(nn.Module):
         weight = self.weight.to(x.device) if self.weight is not None else None
         return F.cross_entropy(self.s * output, target, weight=self.weight, reduction='none')
     
+class CBWLoss(nn.Module):
+    def __init__(self, freq, reduction='mean'):
+        super(CBWLoss, self).__init__()
+        freq = freq.clone()
+        freq[freq == 0] = 1  # prevent div-by-zero
+        weight = freq.sum() / (freq.shape[0] * freq)
+        weight = weight.type(torch.float32)
+        self.register_buffer('weight', weight)
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        return F.cross_entropy(logits, targets, weight=self.weight, reduction=self.reduction)
+    
+ 
+class GRWLoss(nn.Module):
+    def __init__(self, freq, exp_scale=1.2, reduction='mean'):
+        super(GRWLoss, self).__init__()
+        freq = freq.clone()
+        freq[freq == 0] = 1  # prevent div-by-zero
+        num_classes = freq.shape[0]
+        exp_reweight = 1 / (freq ** exp_scale)
+        exp_reweight = exp_reweight / exp_reweight.sum() * num_classes
+        exp_reweight = exp_reweight.type(torch.float32)
+        self.register_buffer('weight', exp_reweight)
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        return F.cross_entropy(logits, targets, weight=self.weight, reduction=self.reduction)   
+    
