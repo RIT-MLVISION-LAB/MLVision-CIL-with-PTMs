@@ -9,11 +9,11 @@
     "increment": 20,
     "model_name": "mos",
     "backbone_type": "vit_base_patch16_224_mos",
-    "device": ["5"],
+    "device": ["3"],
     "seed": [1993],
     
     "tuned_epoch": 20,
-    "init_lr": 0.02,
+    "init_lr": 0.05,
     "batch_size": 32,
     "weight_decay": 0.005,
     "min_lr": 0,
@@ -44,10 +44,10 @@
     "loss_type" : "ldam",
     "loss_type_choices": ["ce", "focal", "ldam", "cb"],
     "ldam_max_m": 0.5,
-    "ldam_s": 15.0
+    "ldam_s": 15.0,
 
+    "classifier_align_imb_oversample": false,
+    "adapter_oversample": false
 
-
-    
 
 }

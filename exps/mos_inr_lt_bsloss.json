@@ -9,11 +9,11 @@
     "increment": 20,
     "model_name": "mos",
     "backbone_type": "vit_base_patch16_224_mos",
-    "device": ["4"],
+    "device": ["0"],
     "seed": [1993],
     
     "tuned_epoch": 20,
-    "init_lr": 0.02,
+    "init_lr": 0.055,
     "batch_size": 32,
     "weight_decay": 0.005,
     "min_lr": 0,
@@ -42,6 +42,11 @@
     "class_order_mode_choices" : ["random", "inc", "dec", "balanced", "first", "last"],
 
     "loss_type" : "balanced_softmax",
-    "loss_type_choices": ["ce", "focal", "ldam", "cb", "balanced_softmax"]
+    "loss_type_choices": ["cb", "focal", "ldam", "balanced_softmax", "cbw", "grw", "ce"],
+
+    "classifier_align_imb_oversample": false,
+    "adapter_oversample": false,
+    "mixup": false
+
 
 }
