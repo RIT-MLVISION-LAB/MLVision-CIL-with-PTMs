@@ -14,7 +14,9 @@ from collections import defaultdict, Counter
 from sklearn.metrics import confusion_matrix
 import os
 from collections import defaultdict
-from utils.losses import FocalLoss, CELoss, LDAMLoss, BalancedSoftmaxLoss
+from utils.losses import FocalLoss, CELoss, LDAMLoss, BalancedSoftmaxLoss, CBWLoss, GRWLoss
+from torch.utils.data import WeightedRandomSampler
+from imblearn.over_sampling import RandomOverSampler
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
@@ -78,6 +80,7 @@ class Learner(BaseLearner):
     def after_task(self):
         self._known_classes = self._total_classes
 
+
     def incremental_train(self, data_manager):
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
@@ -90,7 +93,46 @@ class Learner(BaseLearner):
 
         self.train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source="train", mode="train")
         self.data_manager = data_manager
-        self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        
+        weighted_sampler = self.args.get("weighted_oversampler", False)
+        if weighted_sampler:
+            print("Using weighted random oversampler in train_dataset")
+            labels = np.array(self.train_dataset.labels)
+            class_counts = np.bincount(labels)
+            weights_per_class = 1.0 / class_counts
+            weights_per_class[class_counts == 0] = 0  # avoid div by zero
+            weights = weights_per_class[labels]
+            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, sampler=sampler, num_workers=num_workers) #real-data oversample with weighted random sampler
+        else:
+            print("Using random oversampler to create balanced train_dataset")
+            oversample = self.args.get("random_oversample", False)
+            if oversample:
+                
+                from torch.utils.data import TensorDataset
+                X = []
+                y = []
+                sample_img, _ = self.train_dataset[0]
+                C, H, W = sample_img.shape
+                for img, label in self.train_dataset:  # Or however you loop it
+                    X.append(img.numpy())  # Assuming your dataset returns tensors
+                    y.append(label)
+
+                    X = np.stack(X)
+                    y = np.array(y)
+                    ros = RandomOverSampler()
+                    X_resampled, y_resampled = ros.fit_resample(X.reshape(len(X), -1), y)
+                    X_resampled = X_resampled.reshape(-1, C, H, W)
+                    X_tensor = torch.tensor(X_resampled).float()
+                    y_tensor = torch.tensor(y_resampled).long()
+
+                    balanced_dataset = TensorDataset(X_tensor, y_tensor)
+                    self.train_loader = DataLoader(balanced_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+            else:
+                print("Using original sampler for in train_dataset")
+                self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+        
+         
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source="test", mode="test" )
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers)
         
@@ -105,7 +147,7 @@ class Learner(BaseLearner):
         self.replace_fc()
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
-
+            
     def _train(self, train_loader, test_loader):
         self._network.backbone.to(self._device)
 
@@ -117,7 +159,11 @@ class Learner(BaseLearner):
 
         self._compute_mean(self._network.backbone)
         if self._cur_task > 0:
-            self.classifer_align(self._network.backbone)
+            if self.args["classifier_align_imb_oversample"]:
+                print("Using oversample for classifier alignment")
+                self.classifer_align_oversample(self._network.backbone)
+            else:
+                self.classifer_align(self._network.backbone)
 
     def get_optimizer(self, model):
         base_params = [p for name, p in model.named_parameters() if 'adapter' in name and p.requires_grad]
@@ -152,120 +198,44 @@ class Learner(BaseLearner):
             scheduler = None
 
         return scheduler
-
-    def _init_train_old(self, train_loader, test_loader, optimizer, scheduler):
-        prog_bar = tqdm(range(self.args['tuned_epoch']))
-        loss_type = self.args.get("loss_type", "ce")
-        logging.info(f"Using loss_type: {loss_type}")
-        
-        # Compute class counts from training labels
-        
-        cur_classes = np.arange(self._known_classes, self._total_classes)
-        labels = np.array(self.train_dataset.labels)
-        class_counts = np.bincount(labels, minlength=self._total_classes)
-        class_counts = torch.tensor(class_counts, dtype=torch.float32, device=self._device)
-        
-        class_counts[:self._known_classes] = 0 # to ignore known classes in the loss computation
-
-        # Compute CB-loss weights
-        beta = 0.9999
-        effective_num = 1.0 - torch.pow(beta, class_counts)
-        weights = (1.0 - beta) / effective_num
-        weights[class_counts == 0] = 0  # zero weight for old classes
-        weights = weights / weights.sum() * len(cur_classes)
-        
-        if loss_type == "ce":
-            criterion = nn.CrossEntropyLoss()
-
-        elif loss_type == "cb":
-            criterion = CELoss(weight=weights)
-        elif loss_type == "balanced_softmax":
-            criterion = BalancedSoftmaxLoss(class_counts=torch.tensor(safe_class_counts, device=self._device))
-
-        elif loss_type == "focal":
-            gamma = self.args.get("focal_gamma", 1.5)
-            criterion = FocalLoss(weight=weights, gamma=gamma)
-
-        elif loss_type == "ldam":
-            max_m = self.args.get("ldam_max_m", 0.5)
-            s = self.args.get("ldam_s", 30)
-            safe_class_counts = class_counts.clone()
-            safe_class_counts[safe_class_counts == 0] = 1.0
-            criterion = LDAMLoss(cls_num_list=safe_class_counts.tolist(), max_m=max_m, weight=weights, s=s)
-
-            #criterion = LDAMLoss(cls_num_list=class_counts.tolist(), max_m=max_m, weight=weights, s=s)
-
+    
+    def mixup_data(self, x, y, alpha=0.5):
+        '''Compute Mixup data'''
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
         else:
-            raise ValueError(f"Unknown loss_type: {loss_type}")
-        
-        for _, epoch in enumerate(prog_bar):
-            self._network.backbone.train()
-            
+            lam = 1.0
 
-            losses = 0.0
-            correct, total = 0, 0
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self._device), targets.to(self._device)
-            
-                output = self._network(inputs, adapter_id=self._cur_task, train=True)
-                logits = output["logits"][:, :self._total_classes]
-                logits[:, :self._known_classes] = float('-inf')
+        batch_size = x.size(0)
+        index = torch.randperm(batch_size).to(x.device)
 
-                #loss = F.cross_entropy(logits, targets.long())
-                loss = criterion(logits, targets).mean()
-                loss += self.orth_loss(output['pre_logits'], targets)
+        mixed_x = lam * x + (1 - lam) * x[index, :]
+        y_a, y_b = y, y[index]
+        return mixed_x, y_a, y_b, lam
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                # # using EMA method to merge adapters
-                if self.args["adapter_momentum"] > 0:
-                    self._network.backbone.adapter_merge()
-                
-                losses += loss.item()
-
-                _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
-
-            if scheduler:
-                scheduler.step()
-            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
-                self._cur_task,
-                epoch + 1,
-                self.args['tuned_epoch'],
-                losses / len(train_loader),
-                train_acc,
-            )
-            prog_bar.set_description(info)
-
-        logging.info(info)
-        
-        
+    
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         prog_bar = tqdm(range(self.args['tuned_epoch']))
 
+        
         # === Compute class counts for this task ===
         labels = np.array(self.train_dataset.labels)
-        class_counts = np.bincount(labels, minlength=self._total_classes)
+        class_counts = np.bincount(labels)
 
-        def is_long_tail(class_counts, threshold=15):
+        def has_imbalance(class_counts, threshold=15):
             counts = class_counts[class_counts > 0]
             if len(counts) == 0:
                 return False
             return counts.max() / (counts.min() + 1e-5) > threshold
 
-        has_imbalance = is_long_tail(class_counts)
+        imbalance = has_imbalance(class_counts)
         imb_ratio = class_counts.max() / (class_counts[class_counts > 0].min() + 1e-5)
         print(f"Imbalance ratio for Task {self._cur_task}: {imb_ratio:.2f}")
 
         total_epochs = self.args['tuned_epoch']
 
         # === Precompute CB weights if needed ===
-        if has_imbalance:
+        if imbalance:
             beta = 0.9999
             effective_num = 1.0 - np.power(beta, class_counts)
             weights = (1.0 - beta) / (effective_num + 1e-8)
@@ -277,45 +247,58 @@ class Learner(BaseLearner):
             weights = None
 
         safe_class_counts = class_counts.copy()
-        safe_class_counts[safe_class_counts == 0] = 1
+        safe_class_counts[safe_class_counts == 0] = 1 # to avoid division by zero in loss functions
 
+
+        loss_type = self.args.get("loss_type", "ce")
+
+        if not imbalance or loss_type =="ce":
+            criterion = nn.CrossEntropyLoss()
+        else:
+            print(f"Using imbalance-aware loss: {loss_type}")
+
+            if loss_type == "cb":
+                criterion = CELoss(weight=weights)
+            elif loss_type == "focal":
+                gamma = self.args.get("focal_gamma", 1.5)
+                criterion = FocalLoss(weight=weights, gamma=gamma)
+            elif loss_type == "ldam":
+                max_m = self.args.get("ldam_max_m", 0.5)
+                s = self.args.get("ldam_s", 30)
+                criterion = LDAMLoss(cls_num_list=safe_class_counts.tolist(), max_m=max_m, weight=weights, s=s)
+            elif loss_type == "balanced_softmax":
+                criterion = BalancedSoftmaxLoss(class_counts=torch.tensor(safe_class_counts, device=self._device))
+            elif loss_type == "cbw":
+                criterion = CBWLoss(freq=torch.tensor(safe_class_counts, device=self._device))
+            elif loss_type == "grw":
+                exp_scale = self.args.get("grw_exp_scale", 1.2)
+                criterion = GRWLoss(freq=torch.tensor(safe_class_counts, device=self._device), exp_scale=exp_scale)  
+            else:
+                raise ValueError(f"Unknown loss_type: {loss_type}")
+                
         for epoch in prog_bar:
             self._network.backbone.train()
-
-            # === DRW: choose loss dynamically ===
-            if not has_imbalance or epoch < total_epochs // 2:
-                criterion = nn.CrossEntropyLoss()
-                if epoch == 0:
-                    print("DRW: Using CE during warm-up phase")
-            else:
-                loss_type = self.args.get("loss_type", "cb")  # fallback
-                print(f"DRW: Using imbalance-aware loss: {loss_type}")
-
-                if loss_type == "cb":
-                    criterion = CELoss(weight=weights)
-                elif loss_type == "focal":
-                    gamma = self.args.get("focal_gamma", 1.5)
-                    criterion = FocalLoss(weight=weights, gamma=gamma)
-                elif loss_type == "ldam":
-                    max_m = self.args.get("ldam_max_m", 0.5)
-                    s = self.args.get("ldam_s", 30)
-                    criterion = LDAMLoss(cls_num_list=safe_class_counts.tolist(), max_m=max_m, weight=weights, s=s)
-                elif loss_type == "balanced_softmax":
-                    criterion = BalancedSoftmaxLoss(class_counts=torch.tensor(safe_class_counts, device=self._device))
-                else:
-                    raise ValueError(f"Unknown loss_type: {loss_type}")
-
             losses = 0.0
             correct, total = 0, 0
 
             for _, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
+                
+                if self.args.get("mixup", False):
+                    inputs, targets_a, targets_b, lam = self.mixup_data(x=inputs, y=targets)
+                else:
+                    inputs, targets_a, targets_b, lam = inputs, targets, targets, 1.0
+                    
 
                 output = self._network(inputs, adapter_id=self._cur_task, train=True)
                 logits = output["logits"][:, :self._total_classes]
                 logits[:, :self._known_classes] = float('-inf')
 
-                loss = criterion(logits, targets).mean()
+                if self.args.get("mixup", False):
+                    loss = lam * criterion(logits, targets_a).mean() + (1 - lam) * criterion(logits, targets_b).mean()
+                else:
+                    loss = criterion(logits, targets).mean()
+                    
                 loss += self.orth_loss(output['pre_logits'], targets)
 
                 optimizer.zero_grad()
@@ -341,6 +324,7 @@ class Learner(BaseLearner):
             )
             prog_bar.set_description(info)
         logging.info(info)
+    
         
     @torch.no_grad()
     def _compute_mean(self, model):
@@ -468,6 +452,119 @@ class Learner(BaseLearner):
                 outputs = model(inp, fc_only=True)
                 logits = outputs['logits'][:, :self._total_classes]
 
+                loss = F.cross_entropy(logits, tgt)
+                
+                _, preds = torch.max(logits, dim=1)
+                
+                correct += preds.eq(tgt.expand_as(preds)).cpu().sum()
+                total += len(tgt)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                losses += loss
+
+            scheduler.step()
+            ca_acc = np.round(tensor2numpy(correct) * 100 / total, decimals=2)
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, CA_accy {:.2f}".format(
+                self._cur_task,
+                epoch + 1,
+                self.crct_epochs,
+                losses / self._total_classes,
+                ca_acc,
+            )
+            prog_bar.set_description(info)
+         
+        logging.info(info)
+    
+    def classifer_align_oversample(self, model):
+        
+        model.train()
+        
+        run_epochs = self.crct_epochs
+        param_list = [p for n, p in model.named_parameters() if p.requires_grad and 'adapter' not in n]
+        network_params = [{'params': param_list, 'lr': self.ca_lr, 'weight_decay': self.weight_decay}]
+        optimizer = optim.SGD(network_params, lr=self.ca_lr, momentum=0.9, weight_decay=5e-4)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=run_epochs)
+        
+        
+        counts = self.data_manager.original_class_distribution.copy()
+        weights = 1.0 / counts
+        weights = weights / weights.sum()
+        total_pseudo_samples = self.batch_size * 5 * self._total_classes * 5
+        num_pseudo_per_class = np.round(weights * total_pseudo_samples).astype(int)
+        #print the original class distribution and the pseudo samples per class
+        print("Original class distribution: ", counts)
+        print("Pseudo samples per class: ", num_pseudo_per_class)
+
+        prog_bar = tqdm(range(run_epochs))
+        for epoch in prog_bar:
+
+            sampled_data = []
+            sampled_label = []
+            num_sampled_pcls = self.batch_size * 5
+
+            if self.args["ca_storage_efficient_method"] in ['covariance', 'variance']:
+                for class_idx in range(self._total_classes):
+                    mean = self.cls_mean[class_idx].to(self._device)
+                    cov = self.cls_cov[class_idx].to(self._device)
+                    if self.args["ca_storage_efficient_method"] == 'variance':
+                        cov = torch.diag(cov)
+                    cov = self.ensure_positive_definite(cov)
+                    m = MultivariateNormal(mean.float(), cov.float())
+                    
+                    n_samples = num_pseudo_per_class[class_idx]
+                    if n_samples < self.batch_size * 5:
+                        n_samples = self.batch_size * 5
+
+                    sampled_data_single = m.sample(sample_shape=(n_samples,))
+                    sampled_data.append(sampled_data_single)
+                    sampled_label.extend([class_idx] * n_samples)
+                    
+                    print(f"Class {class_idx}, sampled: {n_samples}") 
+                    
+                    
+                    #sampled_data_single = m.sample(sample_shape=(num_sampled_pcls,))
+                    #sampled_data.append(sampled_data_single)
+
+                    #sampled_label.extend([class_idx] * num_sampled_pcls)
+
+            elif self.args["ca_storage_efficient_method"] == 'multi-centroid':
+                for class_idx in range(self._total_classes):
+                    for cluster in range(len(self.cls_mean[class_idx])):
+                        mean = self.cls_mean[class_idx][cluster]
+                        var = self.cls_cov[class_idx][cluster]
+                        if var.mean() == 0:
+                            continue
+                        m = MultivariateNormal(mean.float(), (torch.diag(var) + 1e-4 * torch.eye(mean.shape[0]).to(mean.device)).float())
+                        sampled_data_single = m.sample(sample_shape=(num_sampled_pcls,))
+                        sampled_data.append(sampled_data_single)
+                        sampled_label.extend([class_idx] * num_sampled_pcls)
+            else:
+                raise NotImplementedError
+
+
+            sampled_data = torch.cat(sampled_data, dim=0).float().to(self._device)
+            sampled_label = torch.tensor(sampled_label).long().to(self._device)
+            if epoch == 0:
+                print("sampled data shape: ", sampled_data.shape)
+
+            inputs = sampled_data
+            targets = sampled_label
+
+            sf_indexes = torch.randperm(inputs.size(0))
+            inputs = inputs[sf_indexes]
+            targets = targets[sf_indexes]
+            
+            dataset = torch.utils.data.TensorDataset(inputs, targets)
+            loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+
+            losses = 0.0
+            correct, total = 0, 0
+            for inp, tgt in loader:
+                outputs = model(inp, fc_only=True)
+                logits = outputs['logits'][:, :self._total_classes]
+                    
                 loss = F.cross_entropy(logits, tgt)
                 
                 _, preds = torch.max(logits, dim=1)
@@ -731,7 +828,7 @@ class Learner(BaseLearner):
         tail_cls = np.where(counts < 20)[0]
 
         print(f"Head classes: {head_cls.tolist()}")
-        print(f"Mid classes: {mid_cls.tolist()}")›
+        print(f"Mid classes: {mid_cls.tolist()}")
         print(f"Tail classes: {tail_cls.tolist()}")
         
         y_pred_ = np.concatenate(y_pred)[:, 0]  # top-1
@@ -750,10 +847,4 @@ class Learner(BaseLearner):
 
         return np.concatenate(y_pred), np.concatenate(y_true), head_acc, mid_acc, tail_acc
     
-    
-    def is_long_tail(class_counts, threshold=1.5):
-        counts = class_counts[class_counts > 0]
-        if len(counts) == 0:
-            return False
-        return counts.max() / (counts.min() + 1e-5) > threshold
 
