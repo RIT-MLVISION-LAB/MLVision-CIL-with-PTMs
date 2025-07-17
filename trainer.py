@@ -28,7 +28,7 @@ def _train(args):
     if not os.path.exists(logs_name):
         os.makedirs(logs_name)
 
-    logfilename = "logs/{}/{}/{}/{}/{}/{}_{}_{}".format(
+    logfilename = "logs/{}/{}/{}/{}/{}/{}_{}_{}_{}_{}".format(
         args["model_name"],
         args["dataset"],
         init_cls,
@@ -37,6 +37,8 @@ def _train(args):
         args["prefix"],
         args["seed"],
         args["backbone_type"],
+        args["loss_type"],
+        args["init_lr"]
     )
     logging.basicConfig(
         level=logging.INFO,
