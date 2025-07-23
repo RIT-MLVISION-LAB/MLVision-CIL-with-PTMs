@@ -42,6 +42,8 @@ def get_model(model_name, args):
         from models.dgr import Learner
     elif name == 'mos':
         from models.mos import Learner
+    elif name == 'mos_moe':
+        from models.mos_moe import Learner
     elif name == 'cofima':
         from models.cofima import Learner
     elif name == 'duct':

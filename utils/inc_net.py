@@ -231,6 +231,36 @@ def get_backbone(args, pretrained=False):
             else:
                 raise NotImplementedError("Unknown type {}".format(name))
             return model
+        elif args["model_name"] == "mos_moe":
+            from backbone import vit_mos_moe
+            from easydict import EasyDict
+            tuning_config = EasyDict(
+                # AdaptFormer
+                ffn_adapt=True,
+                ffn_option="parallel",
+                ffn_adapter_layernorm_option="none",
+                ffn_adapter_init_option="lora",
+                ffn_adapter_scalar="0.1",
+                ffn_num=ffn_num,
+                d_model=768,
+                _device = args["device"][0],
+                adapter_momentum = args["adapter_momentum"],
+                # VPT related
+                vpt_on=False,
+                vpt_num=0,
+                # MoE related
+                num_experts=3,
+                top_k=1,
+            )
+            if name == "vit_base_patch16_224_mos_moe":
+                model = vit_mos_moe.vit_base_patch16_224_mos_moe(num_classes=args["nb_classes"],
+                    global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
+            elif name == "vit_base_patch16_224_in21k_mos_moe":
+                model = vit_mos_moe.vit_base_patch16_224_in21k_mos_moe(num_classes=args["nb_classes"],
+                    global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
+            else:
+                raise NotImplementedError("Unknown type {}".format(name))
+            return model
     else:
         raise NotImplementedError("Unknown type {}".format(name))
 
