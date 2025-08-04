@@ -103,14 +103,47 @@ class MoEAdapter(nn.Module):
             for _ in range(num_experts)
         ])
         self.router = nn.Linear(config.d_model, num_experts)
+        self.cls2expert = None  # Mapping from class indices to expert indices for guided routing
+        self.guided_routing = False
 
-    def forward(self, x, add_residual=True, residual=None):
+    def set_guided_routing(self, cls2expert, guided=True):
+        """Set the class-to-expert mapping for guided routing"""
+        self.cls2expert = cls2expert
+        self.guided_routing = guided
+
+    def forward(self, x, add_residual=True, residual=None, targets=None, return_loss=False):
         residual = x if residual is None else residual
         B, N, D = x.shape
 
-        # Get router scores and top-k selection
+        # Get router scores
         scores = self.router(x)  # [B, N, num_experts]
-        topk_scores, topk_indices = torch.topk(scores, self.top_k, dim=-1)  # [B, N, K]
+
+        router_loss = 0
+        if return_loss and targets is not None and self.cls2expert is not None:
+            pooled_scores = scores.mean(dim=1)  # [B, num_experts]
+            target_experts = torch.tensor([self.cls2expert.get(t.item(), 1) for t in targets]).to(scores.device)
+            router_loss = nn.functional.cross_entropy(pooled_scores, target_experts)
+
+        if self.guided_routing and targets is not None and self.cls2expert is not None:
+            # Create guidance mask based on class-to-expert mapping
+            guidance_mask = torch.full_like(scores, float('-inf'))
+
+            for batch_idx, target in enumerate(targets):
+                target_class = target.item()
+                if target_class in self.cls2expert:
+                    preferred_expert = self.cls2expert[target_class]
+                    guidance_mask[batch_idx, :, preferred_expert] = 0.0  # Allow routing to preferred expert
+                else:
+                    # If class not in mapping, allow all experts
+                    guidance_mask[batch_idx, :, :] = 0.0
+
+            # Apply guidance mask to scores
+            guided_scores = scores + guidance_mask
+        else:
+            guided_scores = scores
+
+        # Get top-k selection
+        topk_scores, topk_indices = torch.topk(guided_scores, self.top_k, dim=-1)  # [B, N, K]
         routing_weights = nn.functional.softmax(topk_scores, dim=-1)  # [B, N, K]
 
         # Initialize output
@@ -152,10 +185,11 @@ class MoEAdapter(nn.Module):
         final_output = output_flat.view(B, N, D)
 
         if add_residual:
-            return final_output + residual
-        else:
-            return final_output
-
+            final_output = final_output + residual
+        
+        if return_loss:
+            return final_output, router_loss
+        return final_output
 
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,):
@@ -219,13 +253,16 @@ class Block(nn.Module):
         self.act = act_layer()
         self.mlp_drop = nn.Dropout(drop)
 
-    def forward(self, x, adapt=None):
+    def forward(self, x, adapt=None, targets=None, return_loss=False):
         x = x + self.drop_path(self.attn(self.norm1(x)))
+        adapter_loss = 0
         if adapt is not None:
-            adapt_x = adapt(x, add_residual=False)
+            if return_loss:
+                adapt_x, adapter_loss = adapt(x, add_residual=False, targets=targets, return_loss=True)
+            else:
+                adapt_x = adapt(x, add_residual=False, targets=targets)
         else:
             adapt_x = None
-            # print("use PTM backbone without adapter.")
 
         residual = x
         x = self.mlp_drop(self.act(self.fc1(self.norm2(x))))
@@ -234,7 +271,7 @@ class Block(nn.Module):
         if adapt_x is not None:
             if self.config.ffn_adapt:
                 if self.config.ffn_option == 'sequential':
-                    x = adapt(x)
+                    x = adapt(x, targets=targets, return_loss=return_loss)
                 elif self.config.ffn_option == 'parallel':
                     x = x + adapt_x
                 else:
@@ -242,6 +279,8 @@ class Block(nn.Module):
 
         x = residual + x
 
+        if return_loss:
+            return x, adapter_loss
         return x
 
 
@@ -318,7 +357,7 @@ class VisionTransformer(nn.Module):
          
         self.config = tuning_config
         self._device = tuning_config._device
-        self.adapter_list = nn.ModuleList()
+        self.moe_adapter_list = nn.ModuleList()
         self.cur_adapter = nn.ModuleList()
 
         self.init_adapters()
@@ -331,6 +370,11 @@ class VisionTransformer(nn.Module):
                                      ).to(self._device)
             self.cur_adapter.append(moe_adapter)
         self.cur_adapter.requires_grad_(True)
+
+    def set_guided_routing(self, cls2expert, guided=True):
+        for adapter in self.cur_adapter:
+            if hasattr(adapter, "set_guided_routing"):
+                adapter.set_guided_routing(cls2expert, guided)
 
     def init_weights(self, mode=''):
         raise NotImplementedError()
@@ -360,13 +404,13 @@ class VisionTransformer(nn.Module):
 
     def adapter_merge(self):
         momentum = self.config.adapter_momentum
-        if len(self.adapter_list) == 0 or momentum == 0:
+        if len(self.moe_adapter_list) == 0 or momentum == 0:
             return
 
         for layer_idx in range(len(self.blocks)):
             for expert_idx in range(self.config.num_experts):
                 current_expert = self.cur_adapter[layer_idx].experts[expert_idx]
-                past_experts = [a[layer_idx].experts[expert_idx] for a in self.adapter_list]
+                past_experts = [moe[layer_idx].experts[expert_idx] for moe in self.moe_adapter_list]
 
                 with torch.no_grad():
                     past_param_dicts = [dict(expert.named_parameters()) for expert in past_experts]
@@ -383,9 +427,9 @@ class VisionTransformer(nn.Module):
                                 param.data = (1 - momentum) * param.data + momentum * avg_param
 
     def adapter_update(self):
-        self.adapter_list.append(copy.deepcopy(self.cur_adapter))
+        self.moe_adapter_list.append(copy.deepcopy(self.cur_adapter))
 
-    def forward_features(self, x, adapter_id, train):       
+    def forward_features(self, x, adapter_id, train, targets=None, return_loss=False):       
         B = x.shape[0]
         x = self.patch_embed(x)
 
@@ -393,18 +437,25 @@ class VisionTransformer(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-        
+
+        total_router_loss = 0
+
         if adapter_id == -1:
             x = self.blocks(x)
         else:
             for layer_idx, blk in enumerate(self.blocks):
-                if adapter_id == len(self.adapter_list):
+                if adapter_id == len(self.moe_adapter_list):
                     adapter = self.cur_adapter[layer_idx]
-                elif adapter_id < len(self.adapter_list):
-                    adapter = self.adapter_list[adapter_id][layer_idx]
+                elif adapter_id < len(self.moe_adapter_list):
+                    adapter = self.moe_adapter_list[adapter_id][layer_idx]
                 else:
                     raise ValueError("Invalid adapter_id")
-                x = blk(x, adapter)
+
+                if train and return_loss:
+                    x, router_loss = blk(x, adapter, targets=targets, return_loss=True)
+                    total_router_loss += router_loss
+                else:
+                    x = blk(x, adapter, targets=targets)
 
         if self.global_pool:
             x = x[:, 1:, :].mean(dim=1)  # global pool without cls token
@@ -418,6 +469,9 @@ class VisionTransformer(nn.Module):
         res['pre_logits'] = outcome
         res['features'] = outcome
         
+        if return_loss:
+            res['router_loss'] = total_router_loss / len(self.blocks)  # Average across layers
+
         return res
 
     def forward_head(self, res):
@@ -427,17 +481,50 @@ class VisionTransformer(nn.Module):
         return res
         
 
-    def forward(self, x, adapter_id=-1, train=False, fc_only=False):
+    def forward(self, x, adapter_id=-1, train=False, fc_only=False, targets=None, return_loss=False):
         if fc_only:
             res = dict()
             res['logits'] = self.head(x)
             return res
         
-        res = self.forward_features(x, adapter_id, train)
+        res = self.forward_features(x, adapter_id, train, targets=targets, return_loss=return_loss)
         res = self.forward_head(res)
         
         return res
 
+    def compute_expert_orthogonality_loss(self):
+        """Encourage diversity within expert groups that serve same class type"""
+        loss = 0
+        count = 0
+
+        for layer_idx in range(len(self.blocks)):
+            adapter = self.cur_adapter[layer_idx]
+            if hasattr(adapter, 'experts'):
+                experts = adapter.experts
+                for i in range(len(experts)):
+                    for j in range(i + 1, len(experts)):
+                        w1_down = experts[i].down_proj.weight
+                        w2_down = experts[j].down_proj.weight
+
+                        w1_up = experts[i].up_proj.weight
+                        w2_up = experts[j].up_proj.weight
+
+                        sim_down = nn.functional.cosine_similarity(
+                            w1_down.view(w1_down.size(0), -1),
+                            w2_down.view(w2_down.size(0), -1),
+                            dim=1
+                        ).mean()
+
+                        sim_up = nn.functional.cosine_similarity(
+                            w1_up.view(w1_up.size(0), -1),
+                            w2_up.view(w2_up.size(0), -1),
+                            dim=1
+                        ).mean()
+
+                        loss += ((sim_down ** 2) + (sim_up ** 2)) / 2.0  # Avg. similarity for down and up projections
+                        count += 1
+
+        return loss / count if count > 0 else 0
 
 def vit_base_patch16_224_mos_moe(pretrained=False, **kwargs):
     

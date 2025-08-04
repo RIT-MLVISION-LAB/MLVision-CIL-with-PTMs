@@ -152,7 +152,36 @@ class Learner(BaseLearner):
 
         return scheduler
 
+    def get_cls2expert_mapping(self, class_freq):
+        sorted_classes = sorted(class_freq.items(), key=lambda x: x[1], reverse=True)
+        num_classes = len(sorted_classes)
+
+        head_split = max(1, int(0.33 * num_classes))
+        mid_split  = max(1, int(0.33 * num_classes))
+
+        head_classes = [cls for cls, _ in sorted_classes[:head_split]]
+        mid_classes  = [cls for cls, _ in sorted_classes[head_split:head_split + mid_split]]
+        tail_classes = [cls for cls, _ in sorted_classes[head_split + mid_split:]]
+
+        cls2expert = {}
+        for cls in head_classes:
+            cls2expert[cls] = 0
+        for cls in mid_classes:
+            cls2expert[cls] = 1
+        for cls in tail_classes:
+            cls2expert[cls] = 2
+
+        return cls2expert
+
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
+        cur_task_cls_freq = Counter()
+
+        for i, (_, inputs, targets) in enumerate(train_loader):
+            cur_task_cls_freq.update(targets.tolist())
+
+        cls2expert = self.get_cls2expert_mapping(cur_task_cls_freq)
+        self._network.backbone.set_guided_routing(cls2expert, guided=True)
+
         prog_bar = tqdm(range(self.args['tuned_epoch']))
         for _, epoch in enumerate(prog_bar):
             self._network.backbone.train()
@@ -162,18 +191,25 @@ class Learner(BaseLearner):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
             
-                output = self._network(inputs, adapter_id=self._cur_task, train=True)
+                output = self._network(inputs, adapter_id=self._cur_task, train=True, targets=targets, return_loss=True)
                 logits = output["logits"][:, :self._total_classes]
                 logits[:, :self._known_classes] = float('-inf')
 
                 loss = F.cross_entropy(logits, targets.long())
-                loss += self.orth_loss(output['pre_logits'], targets)
+                router_loss = output.get('router_loss', 0) * 0.25
+                # Expert orthogonality loss (every N steps to save computation)
+                if i % 10 == 0:
+                    orth_loss = self._network.backbone.compute_expert_orthogonality_loss() * 0.05
+                else:
+                    orth_loss = 0
+
+                loss += self.orth_loss(output['pre_logits'], targets) + router_loss + orth_loss
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 
-                # # using EMA method to merge adapters
+                # using EMA method to merge adapters
                 if self.args["adapter_momentum"] > 0:
                     self._network.backbone.adapter_merge()
                 
@@ -375,6 +411,7 @@ class Learner(BaseLearner):
         self._network.eval()
         y_pred, y_true = [], []
         orig_y_pred = []
+        oracle_y_pred = []
         MAX_ITER = 4
         class_stats = defaultdict(lambda: {
             "count": 0,
@@ -393,6 +430,17 @@ class Learner(BaseLearner):
                 
                 # test the accuracy of the original model
                 orig_y_pred.append(orig_preds)
+
+                # oracle predictions: using ground truth labels to determine correct adapter
+                oracle_logits_list = []
+                for idx, target in enumerate(targets):
+                    true_adapter_id = self.cls2task[target.item()]
+                    oracle_features = self._network.backbone(inputs[idx].unsqueeze(0), adapter_id=true_adapter_id, train=False)["features"]
+                    oracle_logits = self._network.backbone(oracle_features, fc_only=True)["logits"][:, :self._total_classes]
+                    oracle_logits_list.append(oracle_logits)
+                oracle_logits = torch.cat(oracle_logits_list, dim=0)
+                oracle_preds = torch.max(oracle_logits, dim=1)[1].cpu().numpy()
+                oracle_y_pred.append(oracle_preds)
                 
                 all_features = torch.zeros(len(inputs), self._cur_task + 1, self._network.backbone.out_dim, device=self._device)
                 for t_id in range(self._cur_task + 1):
@@ -441,16 +489,18 @@ class Learner(BaseLearner):
                 else:
                     outputs = final_logits
                 
-            predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]  # [bs, topk]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
         orig_acc = (np.concatenate(orig_y_pred) == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
-        logging.info("the accuracy of the original model:{}".format(np.around(orig_acc, 2)))
+        logging.info("Original model accuracy (adapter 0): {:.2f}".format(orig_acc))
+
+        refined_acc = (np.concatenate(y_pred)[:, 0] == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
+        logging.info("Self-refined model accuracy: {:.2f}".format(refined_acc))
+
+        oracle_acc = (np.concatenate(oracle_y_pred) == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
+        logging.info("Oracle model accuracy (correct adapter): {:.2f}".format(oracle_acc))
 
         # logging class-wise refinement statistics
         logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'CorrectIterHist':<35} {'WrongIterHist':<35} {'WrongAdapters':<20}")

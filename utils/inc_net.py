@@ -1244,7 +1244,7 @@ class MOSNet(nn.Module):
                 
         return res
         
-    def forward(self, x, adapter_id=-1, train=False, fc_only=False):
-        res = self.backbone(x, adapter_id, train, fc_only)
+    def forward(self, x, adapter_id=-1, train=False, fc_only=False, targets=None, return_loss=False):
+        res = self.backbone(x, adapter_id, train, fc_only, targets=targets, return_loss=return_loss)
 
         return res
