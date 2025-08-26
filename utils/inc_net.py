@@ -249,8 +249,8 @@ def get_backbone(args, pretrained=False):
                 vpt_on=False,
                 vpt_num=0,
                 # MoE related
-                num_experts=3,
-                top_k=1,
+                num_experts=args["num_experts"],
+                top_k=args["top_k"],
             )
             if name == "vit_base_patch16_224_mos_moe":
                 model = vit_mos_moe.vit_base_patch16_224_mos_moe(num_classes=args["nb_classes"],

@@ -60,7 +60,7 @@ class Learner(BaseLearner):
                 (_,data, label) = batch
                 data = data.to(self._device)
                 label = label.to(self._device)
-                embedding = model.forward_orig(data)['features']
+                embedding = model.backbone(data, adapter_id=self._cur_task, train=False)['features']
                 embedding_list.append(embedding.cpu())
                 label_list.append(label.cpu())
         embedding_list = torch.cat(embedding_list, dim=0)
@@ -152,41 +152,23 @@ class Learner(BaseLearner):
 
         return scheduler
 
-    def get_cls2expert_mapping(self, class_freq):
-        sorted_classes = sorted(class_freq.items(), key=lambda x: x[1], reverse=True)
-        num_classes = len(sorted_classes)
-
-        head_split = max(1, int(0.33 * num_classes))
-        mid_split  = max(1, int(0.33 * num_classes))
-
-        head_classes = [cls for cls, _ in sorted_classes[:head_split]]
-        mid_classes  = [cls for cls, _ in sorted_classes[head_split:head_split + mid_split]]
-        tail_classes = [cls for cls, _ in sorted_classes[head_split + mid_split:]]
-
-        cls2expert = {}
-        for cls in head_classes:
-            cls2expert[cls] = 0
-        for cls in mid_classes:
-            cls2expert[cls] = 1
-        for cls in tail_classes:
-            cls2expert[cls] = 2
-
-        return cls2expert
-
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
         cur_task_cls_freq = Counter()
 
-        for i, (_, inputs, targets) in enumerate(train_loader):
+        for _, _, targets in train_loader:
             cur_task_cls_freq.update(targets.tolist())
 
-        cls2expert = self.get_cls2expert_mapping(cur_task_cls_freq)
-        self._network.backbone.set_guided_routing(cls2expert, guided=True)
+        self._network.backbone.set_hierarchical_routing(dict(cur_task_cls_freq))
 
         prog_bar = tqdm(range(self.args['tuned_epoch']))
         for _, epoch in enumerate(prog_bar):
             self._network.backbone.train()
 
+            for adapter in self._network.backbone.cur_adapter:
+                adapter.reset_expert_usage()
+
             losses = 0.0
+            router_losses = 0.0
             correct, total = 0, 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)
@@ -196,24 +178,26 @@ class Learner(BaseLearner):
                 logits[:, :self._known_classes] = float('-inf')
 
                 loss = F.cross_entropy(logits, targets.long())
-                router_loss = output.get('router_loss', 0) * 0.25
-                # Expert orthogonality loss (every N steps to save computation)
-                if i % 10 == 0:
-                    orth_loss = self._network.backbone.compute_expert_orthogonality_loss() * 0.05
-                else:
-                    orth_loss = 0
+                router_loss = output.get('router_loss', 0) * 0.5
+                # Expert orthogonality loss
+                orth_loss = 0
+                # if i % 10 == 0:
+                    # orth_loss = self._network.backbone.compute_expert_orthogonality_loss() * 0.05
+                    # orth_loss = self._network.backbone.compute_cross_task_expert_orthogonality_loss() * 0.05
 
                 loss += self.orth_loss(output['pre_logits'], targets) + router_loss + orth_loss
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                
+
                 # using EMA method to merge adapters
                 if self.args["adapter_momentum"] > 0:
                     self._network.backbone.adapter_merge()
-                
+
                 losses += loss.item()
+                if isinstance(router_loss, torch.Tensor):
+                    router_losses += router_loss.item()
 
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
@@ -223,16 +207,101 @@ class Learner(BaseLearner):
                 scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Router KLD Loss {:.3f}, Train_accy {:.2f}".format(
                 self._cur_task,
                 epoch + 1,
                 self.args['tuned_epoch'],
                 losses / len(train_loader),
+                router_losses / len(train_loader),
                 train_acc,
             )
             prog_bar.set_description(info)
+            self._log_expert_utilization(epoch)
 
+        self._log_expert_utilization_summary()
         logging.info(info)
+
+    def _log_expert_utilization(self, epoch):
+        """Log expert utilization statistics for current epoch"""
+        # Aggregate stats across all layers
+        total_usage = torch.zeros(self.args['num_experts'])
+        num_layers = len(self._network.backbone.cur_adapter)
+
+        for _, adapter in enumerate(self._network.backbone.cur_adapter):
+            layer_usage = adapter.get_expert_usage()
+            total_usage += layer_usage
+
+        # Average across layers
+        avg_usage = total_usage / num_layers
+
+        # Convert to percentages
+        usage_percentages = (avg_usage * 100).numpy()
+
+        # Log the statistics
+        logging.info(f"Task {self._cur_task} => Epoch {epoch+1} Expert Utilization:")
+        logging.info(f"General Expert (0):  {usage_percentages[0]:.2f}%")
+        logging.info(f"Majority Expert (1): {usage_percentages[1]:.2f}%")
+        logging.info(f"Minority Expert (2): {usage_percentages[2]:.2f}%")
+
+        # Check for imbalance
+        max_usage = usage_percentages.max()
+        min_usage = usage_percentages.min()
+        imbalance_ratio = max_usage / (min_usage + 1e-8)
+
+        if imbalance_ratio > 3.0:  # If one expert is used 3x more than another
+            logging.warning(f"High imbalance detected! Ratio: {imbalance_ratio:.2f}")
+
+    def _log_expert_utilization_summary(self):
+        """Log final summary of expert utilization across all epochs"""
+        logging.info(f"TASK {self._cur_task} EXPERT UTILIZATION SUMMARY")
+        logging.info("="*50)
+
+        # Get layer-wise statistics
+        for layer_idx in [0, len(self._network.backbone.cur_adapter)//2, -1]:  # First, middle, last layer
+            adapter = self._network.backbone.cur_adapter[layer_idx]
+            usage = adapter.get_expert_usage()
+            usage_pct = (usage * 100).numpy()
+
+            layer_name = "First" if layer_idx == 0 else "Middle" if layer_idx > 0 else "Last"
+            logging.info(f"{layer_name} Layer (#{layer_idx})=> General: {usage_pct[0]:.2f}% | Majority: {usage_pct[1]:.2f}% | Minority: {usage_pct[2]:.2f}%")
+
+    def _compute_semantic_clusters(self, train_loader, num_clusters=3):
+        self._network.backbone.eval()
+        class_features = defaultdict(list)
+
+        with torch.no_grad():
+            for _, inputs, targets in train_loader:
+                inputs = inputs.to(self._device)
+                features = self._network.backbone(inputs, adapter_id=self._cur_task, train=False)['features']
+                for feat, label in zip(features, targets):
+                    class_features[label.item()].append(feat)
+
+        # Compute class prototypes with stability checks
+        class_prototypes = {}
+
+        for cls, feats in class_features.items():
+            class_prototypes[cls] = torch.stack(feats).mean(dim=0)
+
+        # Normalize prototypes
+        prototypes_tensor = torch.stack([class_prototypes[cls] for cls in sorted(class_prototypes.keys())])
+        prototypes_normalized = F.normalize(prototypes_tensor, dim=1)
+
+        # K-means clustering
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=min(num_clusters, len(class_prototypes)), n_init=10)
+        cluster_assignments = kmeans.fit_predict(prototypes_normalized.cpu().numpy())
+
+        cls2expert = {}
+        for idx, cls in enumerate(sorted(class_prototypes.keys())):
+            cls2expert[cls] = cluster_assignments[idx]
+
+        # Log clustering statistics
+        expert_counts = Counter(cls2expert.values())
+        logging.info(f"Expert distribution: {dict(expert_counts)}")
+        logging.info(f"Class-to-expert mapping: {cls2expert}")
+
+        self._network.backbone.train()
+        return cls2expert
 
     @torch.no_grad()
     def _compute_mean(self, model):
@@ -406,138 +475,86 @@ class Learner(BaseLearner):
             loss = torch.nn.functional.cross_entropy(sim, torch.arange(0, sim.shape[0]).long().to(self._device))
             return self.args["reg"] * loss
             # return 0.0
-    
+
     def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
-        orig_y_pred = []
-        oracle_y_pred = []
-        MAX_ITER = 4
-        class_stats = defaultdict(lambda: {
-            "count": 0,
-            "correct": 0,
-            "wrong_adapter_ids": Counter(),
-            "correct_iter_hist": Counter(),
-            "wrong_iter_hist": Counter(),
-        })
+
+        class_stats = defaultdict(lambda: {"count": 0, "correct": 0})
+
+        # Pre-compute prototype information
+        prototype_matrix = []
+        class_indices = sorted(self.cls_mean.keys())
+        for class_idx in class_indices:
+            prototype_matrix.append(self.cls_mean[class_idx])
+        prototype_matrix = torch.stack(prototype_matrix).to(self._device)  # [num_classes, feature_dim]
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
             with torch.no_grad():
-                orig_logits = self._network.forward_orig(inputs)["logits"][:, :self._total_classes]
-                orig_preds = torch.max(orig_logits, dim=1)[1].cpu().numpy()
-                orig_idx = torch.tensor([self.cls2task[v] for v in orig_preds], device=self._device)
-                
-                # test the accuracy of the original model
-                orig_y_pred.append(orig_preds)
+                # Extract features from all adapters for all samples
+                all_adapter_features = []
+                for task_id in range(self._cur_task + 1):
+                    features = self._network.backbone(inputs, adapter_id=task_id, train=False)["features"]
+                    all_adapter_features.append(features)  # Each is [B, feature_dim]
 
-                # oracle predictions: using ground truth labels to determine correct adapter
-                oracle_logits_list = []
-                for idx, target in enumerate(targets):
-                    true_adapter_id = self.cls2task[target.item()]
-                    oracle_features = self._network.backbone(inputs[idx].unsqueeze(0), adapter_id=true_adapter_id, train=False)["features"]
-                    oracle_logits = self._network.backbone(oracle_features, fc_only=True)["logits"][:, :self._total_classes]
-                    oracle_logits_list.append(oracle_logits)
-                oracle_logits = torch.cat(oracle_logits_list, dim=0)
-                oracle_preds = torch.max(oracle_logits, dim=1)[1].cpu().numpy()
-                oracle_y_pred.append(oracle_preds)
-                
-                all_features = torch.zeros(len(inputs), self._cur_task + 1, self._network.backbone.out_dim, device=self._device)
-                for t_id in range(self._cur_task + 1):
-                    t_features = self._network.backbone(inputs, adapter_id=t_id, train=False)["features"]
-                    all_features[:, t_id, :] = t_features
-                
-                # self-refined
                 final_logits = []
-                
-                for x_id in range(len(inputs)):
-                    loop_num = 0
-                    prev_adapter_idx = orig_idx[x_id]
-                    while True:
-                        loop_num += 1
-                        cur_feature = all_features[x_id, prev_adapter_idx].unsqueeze(0) # shape=[1, 768]
-                        cur_logits = self._network.backbone(cur_feature, fc_only=True)["logits"][:, :self._total_classes]
-                        cur_pred = torch.max(cur_logits, dim=1)[1].cpu().numpy()
-                        cur_adapter_idx = torch.tensor([self.cls2task[v] for v in cur_pred], device=self._device)[0]
-                        
-                        if loop_num >= MAX_ITER or cur_adapter_idx == prev_adapter_idx:
-                            break
-                        else:
-                            prev_adapter_idx = cur_adapter_idx
-                        
-                    final_logits.append(cur_logits)
 
-                    # logging refinement statistics
-                    label = targets[x_id].item()
-                    pred = cur_pred[0]
+                # Process each sample
+                for sample_idx in range(inputs.size(0)):
+                    # Collect features from all adapters for this sample
+                    sample_features = [feature[sample_idx] for feature in all_adapter_features]
 
-                    stat = class_stats[label]
-                    stat["count"] += 1
-                    if pred == label:
-                        stat["correct"] += 1
-                        stat["correct_iter_hist"][loop_num] += 1
-                    else:
-                        stat["wrong_iter_hist"][loop_num] += 1
-                        stat["wrong_adapter_ids"][prev_adapter_idx.item()] += 1
+                    # Find nearest prototype
+                    min_dist = float('inf')
+                    best_task_id = 0
 
-                final_logits = torch.cat(final_logits, dim=0).to(self._device)
+                    for idx, class_idx in enumerate(class_indices):
+                        # Use features from the adapter that matches the prototype's task
+                        prototype = prototype_matrix[idx].unsqueeze(0)
+                        proto_task = self.cls2task[class_idx]
+                        sample_task_features = sample_features[proto_task].unsqueeze(0)
 
-                if self.ensemble:
-                    final_logits = F.softmax(final_logits, dim=1)
-                    orig_logits = F.softmax(orig_logits / (1/(self._cur_task+1)), dim=1)
-                    outputs = final_logits + orig_logits
-                else:
-                    outputs = final_logits
-                
-            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]  # [bs, topk]
+                        # Compute distance
+                        sample_task_features = F.normalize(sample_task_features, dim=1)
+                        prototype = F.normalize(prototype, dim=1)
+                        dist = 1 - F.cosine_similarity(sample_task_features, prototype, dim=1).item()
+
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_task_id = proto_task
+
+                    # Get final prediction using best adapter
+                    best_features = sample_features[best_task_id].unsqueeze(0)
+                    sample_logits = self._network.backbone(best_features, fc_only=True)["logits"][:, :self._total_classes]
+                    final_logits.append(sample_logits)
+
+                final_logits = torch.cat(final_logits, dim=0)
+                outputs = final_logits
+
+            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]
+            batch_predictions = predicts[:, 0].cpu().numpy()  # Top-1 predictions
+            batch_targets = targets.cpu().numpy()
+
+            for pred, true_label in zip(batch_predictions, batch_targets):
+                class_stats[true_label]["count"] += 1
+                if pred == true_label:
+                    class_stats[true_label]["correct"] += 1
+
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
-        orig_acc = (np.concatenate(orig_y_pred) == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
-        logging.info("Original model accuracy (adapter 0): {:.2f}".format(orig_acc))
-
-        refined_acc = (np.concatenate(y_pred)[:, 0] == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
-        logging.info("Self-refined model accuracy: {:.2f}".format(refined_acc))
-
-        oracle_acc = (np.concatenate(oracle_y_pred) == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
-        logging.info("Oracle model accuracy (correct adapter): {:.2f}".format(oracle_acc))
-
-        # logging class-wise refinement statistics
-        logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'CorrectIterHist':<35} {'WrongIterHist':<35} {'WrongAdapters':<20}")
-        logging.info("-" * 160)
-        for cls in sorted(class_stats.keys()):
-            entry = class_stats[cls]
-            acc = 100 * entry["correct"] / entry["count"] if entry["count"] > 0 else 0
-            correct_hist = dict(entry["correct_iter_hist"])
-            wrong_hist = dict(entry["wrong_iter_hist"])
-            wrong_adapter_summary = dict(entry["wrong_adapter_ids"])
-
-            logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {str(correct_hist):<35} {str(wrong_hist):<35} {str(wrong_adapter_summary):<20}")
-
-        y_pred_flat = np.concatenate(y_pred)[:, 0]  # Take top-1 prediction
-        y_true_flat = np.concatenate(y_true)
-        cm = confusion_matrix(y_true_flat, y_pred_flat, labels=np.arange(self._total_classes))
-
-        init_cls = 0 if self.args ["init_cls"] == self.args["increment"] else self.args["init_cls"]
-        class_order_mode = self.args.get("class_order_mode", "random")
-        logs_dir = os.path.join(
-            "logs",
-            self.args["model_name"],
-            self.args["dataset"],
-            str(init_cls),
-            str(self.args["increment"]),
-            class_order_mode,
-            "confusions"
-        )
-        os.makedirs(logs_dir, exist_ok=True)
-        cm_save_path = os.path.join(logs_dir, f"cm_task_{self._cur_task}.npy")
-        np.save(cm_save_path, cm)
+        y_pred_all = np.concatenate(y_pred)[:, 0]  # Top-1 predictions
+        y_true_all = np.concatenate(y_true)
+        acc = (y_pred_all == y_true_all).sum() * 100 / len(y_true_all)
+        logging.info("Prototype matched inference accuracy: {:.2f}%".format(acc))
 
         # logging long-tail accuracies
         if "lt" in self.args["dataset"] and self.args["dataset"] in LONGTAIL_SPLIT_SPEC:
             thresholds = LONGTAIL_SPLIT_SPEC[self.args["dataset"]]
             head_threshold = thresholds["head_threshold"]
             tail_threshold = thresholds["tail_threshold"]
+
             current_train_class_counts = Counter(self.train_dataset.labels)
             self._known_classes_histogram.update(current_train_class_counts)
             all_train_class_counts = self._known_classes_histogram
@@ -547,23 +564,38 @@ class Learner(BaseLearner):
             mid_classes = set(all_train_class_counts.keys()) - head_classes - tail_classes
 
             head_accs, mid_accs, tail_accs = [], [], []
+            head_correct, head_total = 0, 0
+            mid_correct, mid_total = 0, 0
+            tail_correct, tail_total = 0, 0
 
             for cls, stats in class_stats.items():
                 n = stats["count"]
-                acc = 100 * stats["correct"] / n if n > 0 else 0
+                correct = stats["correct"]
+                acc = 100 * correct / n if n > 0 else 0
                 if cls in head_classes:
                     head_accs.append(acc)
+                    head_correct += correct
+                    head_total += n
                 elif cls in tail_classes:
                     tail_accs.append(acc)
+                    tail_correct += correct
+                    tail_total += n
                 elif cls in mid_classes:
                     mid_accs.append(acc)
+                    mid_correct += correct
+                    mid_total += n
 
+            # logging average accuracies
             head_avg = np.mean(head_accs) if head_accs else 0.0
             mid_avg = np.mean(mid_accs) if mid_accs else 0.0
             tail_avg = np.mean(tail_accs) if tail_accs else 0.0
 
-            logging.info(f"[Task {self._cur_task}] Head-Class Accuracy: {head_avg:.2f}")
-            logging.info(f"[Task {self._cur_task}] Mid-Class Accuracy: {mid_avg:.2f}")
-            logging.info(f"[Task {self._cur_task}] Tail-Class Accuracy: {tail_avg:.2f}")
+            logging.info(f"\n{'='*60}")
+            logging.info(f"[Task {self._cur_task}] Long-tail Performance Analysis:")
+            logging.info(f"{'='*60}")
+            logging.info(f"Head Classes ({len(head_classes)} classes, {head_total} samples): Class-averaged accuracy: {head_avg:.2f}%")
+            logging.info(f"Mid Classes ({len(mid_classes)} classes, {mid_total} samples): Class-averaged accuracy: {mid_avg:.2f}%")
+            logging.info(f"Tail Classes ({len(tail_classes)} classes, {tail_total} samples): Class-averaged accuracy: {tail_avg:.2f}%")
+            logging.info(f"{'='*60}\n")
 
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]

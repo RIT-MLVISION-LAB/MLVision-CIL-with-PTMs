@@ -95,6 +95,9 @@ class MoEAdapter(nn.Module):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.GENERAL_EXPERT = 0
+        self.MAJORITY_EXPERT = 1
+        self.MINORITY_EXPERT = 2
         self.experts = nn.ModuleList([
             Adapter(config, d_model, bottleneck, dropout,
                     init_option=config.ffn_adapter_init_option,
@@ -103,92 +106,139 @@ class MoEAdapter(nn.Module):
             for _ in range(num_experts)
         ])
         self.router = nn.Linear(config.d_model, num_experts)
-        self.cls2expert = None  # Mapping from class indices to expert indices for guided routing
+        self.cls2expert_probs = {}  # mapping from class indices to soft expert probabilities for guided routing
         self.guided_routing = False
+        self.expert_usage_counts = torch.zeros(num_experts)
+        self.total_routing_decisions = 0
 
-    def set_guided_routing(self, cls2expert, guided=True):
-        """Set the class-to-expert mapping for guided routing"""
-        self.cls2expert = cls2expert
-        self.guided_routing = guided
+    def get_expert_usage(self):
+        if self.total_routing_decisions == 0:
+            return torch.zeros(self.num_experts)
+        return self.expert_usage_counts / self.total_routing_decisions
+
+    def reset_expert_usage(self):
+        self.expert_usage_counts = torch.zeros(self.num_experts)
+        self.total_routing_decisions = 0
+
+    def set_class_expert_distribution(self, class_counts):
+        """
+        Compute soft expert distribution for each class based on frequency
+        """
+        cls2expert_probs = {}
+        sorted_classes = sorted(class_counts.items(), key=lambda x: x[1], reverse=True)
+        n_classes = len(sorted_classes)
+
+        head_boundary = int(n_classes * 0.3)  # Top 30% majority
+        tail_boundary = int(n_classes * 0.7)  # Bottom 30% minority
+
+        for idx, (cls, _) in enumerate(sorted_classes):
+            expert_probs = torch.zeros(self.num_experts)    # Initialize soft probabilities
+
+            if idx < head_boundary:   # Majority classes: primarily use general + majority experts
+                expert_probs[self.GENERAL_EXPERT] = 0.1
+                expert_probs[self.MAJORITY_EXPERT] = 0.9
+                expert_probs[self.MINORITY_EXPERT] = 0.0
+            elif idx >= tail_boundary:   # Minority classes: primarily use general + minority experts
+                expert_probs[self.GENERAL_EXPERT] = 0.1
+                expert_probs[self.MAJORITY_EXPERT] = 0.0
+                expert_probs[self.MINORITY_EXPERT] = 0.9
+            else:   # Mid classes: balanced use of all experts
+                expert_probs[self.GENERAL_EXPERT] = 0.8
+                expert_probs[self.MAJORITY_EXPERT] = 0.1
+                expert_probs[self.MINORITY_EXPERT] = 0.1
+
+            cls2expert_probs[cls] = expert_probs
+
+        self.cls2expert_probs = cls2expert_probs
+        self.guided_routing = True
+
+    def compute_load_balancing_loss(self, scores):
+        """
+        Encourages balanced usage of experts without forcing specific mappings
+        """
+        topk_scores, topk_indices = torch.topk(scores, self.top_k, dim=-1)  # [B, N, K]
+        routing_weights = nn.functional.softmax(topk_scores, dim=-1)  # [B, N, K]
+        expert_usage = torch.zeros(self.num_experts, device=scores.device)
+
+        for k in range(self.top_k):
+            expert_indices = topk_indices[:, :, k].flatten()  # [B*N]
+            weights = routing_weights[:, :, k].flatten()  # [B*N]
+            for expert_id in range(self.num_experts):
+                mask = (expert_indices == expert_id)
+                expert_usage[expert_id] += weights[mask].sum()
+
+        expert_usage = expert_usage / expert_usage.sum()  # Normalize by total weight
+        target_usage = 1.0 / self.num_experts
+        load_balance_loss = ((expert_usage - target_usage) ** 2).sum()  # MSE loss for balanced usage
+
+        return load_balance_loss
 
     def forward(self, x, add_residual=True, residual=None, targets=None, return_loss=False):
         residual = x if residual is None else residual
         B, N, D = x.shape
+        router_scores = self.router(x)  # [B, N, num_experts]
+        router_probs = nn.functional.softmax(router_scores, dim=-1)  # [B, N, num_experts]
 
-        # Get router scores
-        scores = self.router(x)  # [B, N, num_experts]
+        kld_loss = 0
 
-        router_loss = 0
-        if return_loss and targets is not None and self.cls2expert is not None:
-            pooled_scores = scores.mean(dim=1)  # [B, num_experts]
-            target_experts = torch.tensor([self.cls2expert.get(t.item(), 1) for t in targets]).to(scores.device)
-            router_loss = nn.functional.cross_entropy(pooled_scores, target_experts)
-
-        if self.guided_routing and targets is not None and self.cls2expert is not None:
-            # Create guidance mask based on class-to-expert mapping
-            guidance_mask = torch.full_like(scores, float('-inf'))
-
-            for batch_idx, target in enumerate(targets):
+        if return_loss and self.guided_routing and targets is not None and self.cls2expert_probs:
+            target_distributions = []
+            for target in targets:
                 target_class = target.item()
-                if target_class in self.cls2expert:
-                    preferred_expert = self.cls2expert[target_class]
-                    guidance_mask[batch_idx, :, preferred_expert] = 0.0  # Allow routing to preferred expert
-                else:
-                    # If class not in mapping, allow all experts
-                    guidance_mask[batch_idx, :, :] = 0.0
+                if target_class in self.cls2expert_probs:
+                    target_distributions.append(self.cls2expert_probs[target_class])
 
-            # Apply guidance mask to scores
-            guided_scores = scores + guidance_mask
-        else:
-            guided_scores = scores
+            if target_distributions:
+                target_distributions = torch.stack(target_distributions).to(router_scores.device)
+                router_probs_pooled = router_probs.mean(dim=1)  # [B, num_experts]
+                kld_loss = nn.functional.kl_div(
+                    router_probs_pooled.log(),
+                    target_distributions,
+                    reduction='batchmean'
+                )
 
         # Get top-k selection
-        topk_scores, topk_indices = torch.topk(guided_scores, self.top_k, dim=-1)  # [B, N, K]
-        routing_weights = nn.functional.softmax(topk_scores, dim=-1)  # [B, N, K]
+        topk_scores, topk_indices = torch.topk(router_scores, k=self.top_k, dim=-1)  # [B, N, K]
+        topk_weights = nn.functional.softmax(topk_scores, dim=-1)  # [B, N, K]
 
-        # Initialize output
+        # tracking expert usage
+        if self.training:
+            with torch.no_grad():
+                for k in range(self.top_k):
+                    expert_indices = topk_indices[:, :, k].flatten()  # [B*N]
+                    for expert_id in range(self.num_experts):
+                        count = (expert_indices == expert_id).sum().item()
+                        self.expert_usage_counts[expert_id] += count
+                self.total_routing_decisions += B * N * self.top_k
+
         final_output = torch.zeros_like(x)  # [B, N, D]
-
-        # Flatten for easier indexing
         x_flat = x.view(-1, D)  # [B*N, D]
         output_flat = final_output.view(-1, D)  # [B*N, D]
 
         for k in range(self.top_k):
-            # Get expert indices and weights for this k position
-            expert_indices = topk_indices[:, :, k]  # [B, N]
-            weights = routing_weights[:, :, k]  # [B, N]
+            expert_indices = topk_indices[:, :, k].view(-1)
+            weights = topk_weights[:, :, k].view(-1)
 
-            # Flatten indices
-            expert_indices_flat = expert_indices.view(-1)  # [B*N]
-            weights_flat = weights.view(-1)  # [B*N]
-
-            # Process each expert
             for expert_id in range(self.num_experts):
-                # Find positions assigned to this expert at this k
-                mask = (expert_indices_flat == expert_id)
+                mask = (expert_indices == expert_id)
 
-                if mask.any():
-                    # Extract tokens and weights for this expert
-                    selected_positions = mask.nonzero(as_tuple=True)[0]  # positions in flattened tensor
-                    selected_tokens = x_flat[selected_positions]  # [num_selected, D]
-                    selected_weights = weights_flat[selected_positions]  # [num_selected]
+                if mask.any():  # Extract tokens and weights for this expert
+                    selected_positions = mask.nonzero(as_tuple=True)[0]
+                    selected_tokens = x_flat[selected_positions]
+                    selected_weights = weights[selected_positions]
 
-                    if len(selected_tokens) > 0:
-                        # Process through expert (batched)
-                        expert_output = self.experts[expert_id](selected_tokens, add_residual=False)
-                        # Apply routing weights
-                        weighted_output = expert_output * selected_weights.unsqueeze(-1)
-                        # Add to final output
-                        output_flat[selected_positions] += weighted_output
+                    expert_output = self.experts[expert_id](selected_tokens, add_residual=False)
+                    weighted_output = expert_output * selected_weights.unsqueeze(-1)
+                    output_flat[selected_positions] += weighted_output
 
-        # Reshape back to original dimensions
-        final_output = output_flat.view(B, N, D)
+        final_output = output_flat.view(B, N, D)    # Reshape back to original dimensions
 
         if add_residual:
             final_output = final_output + residual
-        
+
         if return_loss:
-            return final_output, router_loss
+            # load_balance_loss = self.compute_load_balancing_loss(router_scores)
+            return final_output, kld_loss
         return final_output
 
 class Attention(nn.Module):
@@ -371,10 +421,11 @@ class VisionTransformer(nn.Module):
             self.cur_adapter.append(moe_adapter)
         self.cur_adapter.requires_grad_(True)
 
-    def set_guided_routing(self, cls2expert, guided=True):
+    def set_hierarchical_routing(self, class_counts):
+        """Set hierarchical routing for all adapter layers"""
         for adapter in self.cur_adapter:
-            if hasattr(adapter, "set_guided_routing"):
-                adapter.set_guided_routing(cls2expert, guided)
+            if hasattr(adapter, 'set_class_expert_distribution'):
+                adapter.set_class_expert_distribution(class_counts)
 
     def init_weights(self, mode=''):
         raise NotImplementedError()
@@ -521,7 +572,51 @@ class VisionTransformer(nn.Module):
                             dim=1
                         ).mean()
 
-                        loss += ((sim_down ** 2) + (sim_up ** 2)) / 2.0  # Avg. similarity for down and up projections
+                        loss += (sim_down ** 2) + (sim_up ** 2)
+                        count += 1
+
+        return loss / count if count > 0 else 0
+
+    def compute_cross_task_expert_orthogonality_loss(self):
+        """Encourage orthogonality between experts from different tasks"""
+        loss = 0
+        count = 0
+
+        # Only compute if we have multiple tasks
+        if len(self.moe_adapter_list) == 0:
+            return 0
+
+        for layer_idx in range(len(self.blocks)):
+            # Compare current task experts with previous task experts
+            cur_experts = self.cur_adapter[layer_idx].experts
+
+            for prev_adapter in self.moe_adapter_list:
+                prev_experts = prev_adapter[layer_idx].experts
+
+                # Compare each expert pair across tasks
+                for cur_expert in cur_experts:
+                    for prev_expert in prev_experts:
+                        # Down projection
+                        cur_down = cur_expert.down_proj.weight
+                        prev_down = prev_expert.down_proj.weight
+
+                        sim_down = nn.functional.cosine_similarity(
+                            cur_down.view(cur_down.size(0), -1),
+                            prev_down.view(prev_down.size(0), -1),
+                            dim=1
+                        ).mean()
+
+                        # Up projection
+                        cur_up = cur_expert.up_proj.weight
+                        prev_up = prev_expert.up_proj.weight
+
+                        sim_up = nn.functional.cosine_similarity(
+                            cur_up.view(cur_up.size(0), -1),
+                            prev_up.view(prev_up.size(0), -1),
+                            dim=1
+                        ).mean()
+
+                        loss += (sim_down ** 2) + (sim_up ** 2)
                         count += 1
 
         return loss / count if count > 0 else 0
