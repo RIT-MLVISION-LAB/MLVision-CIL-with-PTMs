@@ -66,6 +66,7 @@ def _train(args):
 
     cnn_curve, nme_curve = {"top1": [], "top5": []}, {"top1": [], "top5": []}
     cnn_matrix, nme_matrix = [], []
+    groupwise_accy_curve = {"head": [], "mid": [], "tail": []}
 
     for task in range(data_manager.nb_tasks):
         logging.info("All params: {}".format(count_parameters(model._network)))
@@ -73,7 +74,7 @@ def _train(args):
             "Trainable params: {}".format(count_parameters(model._network, True))
         )
         model.incremental_train(data_manager)
-        cnn_accy, nme_accy = model.eval_task()
+        cnn_accy, nme_accy, head_avg, mid_avg, tail_avg = model.eval_task()
         model.after_task()
 
         if nme_accy is not None:
@@ -99,11 +100,35 @@ def _train(args):
             logging.info("NME top1 curve: {}".format(nme_curve["top1"]))
             logging.info("NME top5 curve: {}\n".format(nme_curve["top5"]))
 
-            print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
-            print('Average Accuracy (NME):', sum(nme_curve["top1"])/len(nme_curve["top1"]))
-
             logging.info("Average Accuracy (CNN): {}".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
             logging.info("Average Accuracy (NME): {}".format(sum(nme_curve["top1"])/len(nme_curve["top1"])))
+
+            if head_avg is not None:
+                groupwise_accy_curve["head"].append(head_avg)
+            if mid_avg is not None:
+                groupwise_accy_curve["mid"].append(mid_avg)
+            if tail_avg is not None:
+                groupwise_accy_curve["tail"].append(tail_avg)
+
+            logging.info("Head class avg accy curve: {}".format(groupwise_accy_curve["head"]))
+            logging.info("Mid class avg accy curve: {}".format(groupwise_accy_curve["mid"]))
+            logging.info("Tail class avg accy curve: {}\n".format(groupwise_accy_curve["tail"]))
+
+            if len(groupwise_accy_curve["head"]):
+                logging.info("Head class avg accy: {}".format(
+                    sum(groupwise_accy_curve["head"])/len(groupwise_accy_curve["head"])))
+            else:
+                logging.info("Head class avg accy: N/A")
+            if len(groupwise_accy_curve["mid"]):
+                logging.info("Mid class avg accy: {}".format(
+                    sum(groupwise_accy_curve["mid"])/len(groupwise_accy_curve["mid"])))
+            else:
+                logging.info("Mid class avg accy: N/A")
+            if len(groupwise_accy_curve["tail"]):
+                logging.info("Tail class avg accy: {}".format(
+                    sum(groupwise_accy_curve["tail"])/len(groupwise_accy_curve["tail"])))
+            else:
+                logging.info("Tail class avg accy: N/A")
         else:
             logging.info("No NME accuracy.")
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
@@ -118,9 +143,34 @@ def _train(args):
             logging.info("CNN top1 curve: {}".format(cnn_curve["top1"]))
             logging.info("CNN top5 curve: {}\n".format(cnn_curve["top5"]))
 
-            print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
 
+            if head_avg is not None:
+                groupwise_accy_curve["head"].append(head_avg)
+            if mid_avg is not None:
+                groupwise_accy_curve["mid"].append(mid_avg)
+            if tail_avg is not None:
+                groupwise_accy_curve["tail"].append(tail_avg)
+
+            logging.info("Head class avg accy curve: {}".format(groupwise_accy_curve["head"]))
+            logging.info("Mid class avg accy curve: {}".format(groupwise_accy_curve["mid"]))
+            logging.info("Tail class avg accy curve: {}\n".format(groupwise_accy_curve["tail"]))
+
+            if len(groupwise_accy_curve["head"]):
+                logging.info("Head class avg accy: {}".format(
+                    sum(groupwise_accy_curve["head"])/len(groupwise_accy_curve["head"])))
+            else:
+                logging.info("Head class avg accy: N/A")
+            if len(groupwise_accy_curve["mid"]):
+                logging.info("Mid class avg accy: {}".format(
+                    sum(groupwise_accy_curve["mid"])/len(groupwise_accy_curve["mid"])))
+            else:
+                logging.info("Mid class avg accy: N/A")
+            if len(groupwise_accy_curve["tail"]):
+                logging.info("Tail class avg accy: {}".format(
+                    sum(groupwise_accy_curve["tail"])/len(groupwise_accy_curve["tail"])))
+            else:
+                logging.info("Tail class avg accy: N/A")
     if 'print_forget' in args.keys() and args['print_forget'] is True:
         if len(cnn_matrix) > 0:
             np_acctable = np.zeros([task + 1, task + 1])

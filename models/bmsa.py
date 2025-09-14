@@ -1,4 +1,5 @@
 import logging
+import copy
 import numpy as np
 import torch
 import os
@@ -17,6 +18,40 @@ from utils.longtail_split_specs import LONGTAIL_SPLIT_SPEC
 
 # tune the model at first session with vpt, and then conduct simple shot.
 num_workers = 8
+
+class MetaSampler(nn.Module):
+    def __init__(self, num_classes, device):
+        super().__init__()
+        self.num_classes = num_classes
+        self.device = device
+        self.sampling_weights = nn.Parameter(torch.zeros(num_classes))  # Learnable sampling parameters for each class
+
+    def get_sampling_distribution(self):
+        # Get normalized sampling probability distribution
+        return F.softmax(self.sampling_weights, dim=0)
+
+    def sample_batch(self, dataset, batch_size):
+        """Sample a batch using Gumbel-Softmax for differentiable sampling"""
+        sampling_probs = self.get_sampling_distribution()  # current sampling distribution
+
+        # computing per-instance sampling rates
+        instance_weights = []
+
+        for i, (_, target) in enumerate(dataset):
+            class_idx = target.item() if torch.is_tensor(target) else target
+            instance_weight = sampling_probs[class_idx]
+            instance_weights.append(instance_weight)
+        instance_weights = torch.stack(instance_weights)
+
+        # Gumbel-Softmax sampling
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(instance_weights) + 1e-20) + 1e-20)
+        perturbed_weights = (torch.log(instance_weights + 1e-20) + gumbel_noise)
+        sampling_scores = F.softmax(perturbed_weights, dim=0)
+
+        # Sample indices based on scores
+        sampled_indices = torch.multinomial(sampling_scores, batch_size, replacement=True)
+
+        return sampled_indices
 
 class Learner(BaseLearner):
     def __init__(self, args):
@@ -60,7 +95,7 @@ class Learner(BaseLearner):
                 (_,data, label) = batch
                 data = data.to(self._device)
                 label = label.to(self._device)
-                embedding = model.forward_orig(data)['features']
+                embedding = model.backbone(data, adapter_id=self._cur_task, train=False)['features']
                 embedding_list.append(embedding.cpu())
                 label_list.append(label.cpu())
         embedding_list = torch.cat(embedding_list, dim=0)
@@ -151,37 +186,159 @@ class Learner(BaseLearner):
             scheduler = None
 
         return scheduler
+    
+    def balanced_softmax_loss(self, logits, targets, class_counts):
+        """Balanced Softmax: l(θ) = -log(n_y * e^η_y / Σ_i n_i * e^η_i)"""
+        class_samples = torch.ones(self._total_classes).to(self._device)
+        for cls, count in class_counts.items():
+            if cls < self._total_classes:
+                class_samples[cls] = max(1, count)
+
+        adjusted_logits = logits + torch.log(class_samples).unsqueeze(0)  # equivalent to n_i * e^η_i in softmax
+
+        return F.cross_entropy(adjusted_logits, targets)
+
+    def _create_meta_dataset(self, train_loader, samples_per_class=5):
+        """Create a class-balanced meta dataset for Meta Sampler optimization"""
+        meta_data = defaultdict(list)
+
+        for _, inputs, targets in train_loader:
+            for i in range(len(targets)):
+                class_idx = targets[i].item()
+                if len(meta_data[class_idx]) < samples_per_class:
+                    meta_data[class_idx].append((inputs[i], targets[i]))
+
+        # Create balanced batches
+        meta_dataset = []
+        for class_idx in meta_data:
+            for data in meta_data[class_idx]:
+                meta_dataset.append(data)
+
+        # Group into mini-batches
+        batch_size = min(32, len(meta_dataset))
+        meta_batches = []
+        for i in range(0, len(meta_dataset), batch_size):
+            batch = meta_dataset[i:i+batch_size]
+            if len(batch) > 0:
+                inputs = torch.stack([b[0] for b in batch])
+                targets = torch.stack([b[1] for b in batch])
+                meta_batches.append((inputs, targets))
+
+        return meta_batches
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
-        prog_bar = tqdm(range(self.args['tuned_epoch']))
-        for _, epoch in enumerate(prog_bar):
-            self._network.backbone.train()
+        cur_task_cls_freq = Counter()
+        all_data = []
+        for _, inputs, targets in train_loader:
+            for i in range(len(targets)):
+                cur_task_cls_freq[targets[i].item()] += 1
+                all_data.append((inputs[i], targets[i]))
 
+        meta_sampler = MetaSampler(self._total_classes, self._device).to(self._device)
+        meta_optimizer = optim.Adam(meta_sampler.parameters(), lr=0.001)
+        meta_dataset = self._create_meta_dataset(train_loader, samples_per_class=5)
+
+        prog_bar = tqdm(range(self.args['tuned_epoch']))
+        for epoch in prog_bar:
+            self._network.backbone.train()
             losses = 0.0
+            epoch_meta_loss = 0.0
+            meta_update_count = 0
             correct, total = 0, 0
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self._device), targets.to(self._device)
-            
+
+            for batch_idx in range(len(train_loader)):
+                # outer loop: model training
+                # sample batch using current meta sampler
+                sampled_indices = meta_sampler.sample_batch(all_data, self.batch_size)
+
+                # prepare batch from sampled indices
+                batch_inputs, batch_targets, sampled_classes = [], [], []
+                for idx in sampled_indices:
+                    inp, tgt = all_data[idx]
+                    batch_inputs.append(inp)
+                    batch_targets.append(tgt)
+                    sampled_classes.append(tgt.item() if torch.is_tensor(tgt) else tgt)
+                inputs = torch.stack(batch_inputs).to(self._device)
+                targets = torch.stack(batch_targets).to(self._device)
+
+                # standard training step with balanced softmax
                 output = self._network(inputs, adapter_id=self._cur_task, train=True)
                 logits = output["logits"][:, :self._total_classes]
                 logits[:, :self._known_classes] = float('-inf')
 
-                loss = F.cross_entropy(logits, targets.long())
-                loss += self.orth_loss(output['pre_logits'], targets)
+                loss = self.balanced_softmax_loss(logits, targets, cur_task_cls_freq)
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                
-                # # using EMA method to merge adapters
+
                 if self.args["adapter_momentum"] > 0:
                     self._network.backbone.adapter_merge()
                 
                 losses += loss.item()
 
                 _, preds = torch.max(logits, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                correct += preds.eq(targets).cpu().sum()
                 total += len(targets)
+
+                # inner loop: meta-sampler update
+                # update meta-sampler every N batches
+                if batch_idx % 10 == 0 and batch_idx > 0:
+                    meta_update_count += 1
+                    # saving current model state
+                    original_state = {name: param.clone() 
+                                    for name, param in self._network.named_parameters() 
+                                    if param.requires_grad}
+
+                    # creating surrogate model via one gradient step: θ' = θ - α∇L_train(θ)
+                    output = self._network(inputs, adapter_id=self._cur_task, train=True)
+                    logits = output["logits"][:, :self._total_classes]
+                    logits[:, :self._known_classes] = float("-inf")
+                    loss_train = self.balanced_softmax_loss(logits, targets, cur_task_cls_freq)
+
+                    optimizer.zero_grad()
+                    loss_train.backward()
+                    optimizer.step()  # creates surrogate model in-place
+
+                    # evaluate surrogate on balanced meta dataset
+                    meta_loss_total = 0
+                    with torch.no_grad():
+                        for meta_inputs, meta_targets in meta_dataset:
+                            meta_inputs = meta_inputs.to(self._device)
+                            meta_targets = meta_targets.to(self._device)
+
+                            meta_output = self._network(meta_inputs, adapter_id=self._cur_task, train=False)
+                            meta_logits = meta_output["logits"][:, :self._total_classes]
+                            meta_logits[:, :self._known_classes] = float("-inf")
+
+                            meta_loss_total += F.cross_entropy(meta_logits, meta_targets).item()
+
+                    meta_loss_avg = meta_loss_total / len(meta_dataset)
+                    epoch_meta_loss += meta_loss_avg
+
+                    # restore original model parameters
+                    with torch.no_grad():
+                        for name, param in self._network.named_parameters():
+                            if name in original_state:
+                                param.copy_(original_state[name])
+
+                    # update meta sampler using reinforce
+                    # since sampling is non-differentiable, use policy gradient
+                    reward = -meta_loss_avg  # lower loss = higher reward
+
+                    # Compute REINFORCE gradient
+                    # ∇J = E[∇log π(a) * R(a)]
+                    meta_optimizer.zero_grad()
+                    grad = torch.zeros_like(meta_sampler.sampling_weights)
+
+                    for cls in range(self._total_classes):
+                        count = sampled_classes.count(cls)
+                        if count > 0:
+                            # Gradient proportional to reward and frequency, (-)ve because loss is minimized (maximize reward)
+                            grad[cls] = -reward * count / len(sampled_classes)
+
+                    meta_sampler.sampling_weights.grad = grad
+                    meta_optimizer.step()
 
             if scheduler:
                 scheduler.step()
@@ -371,118 +528,79 @@ class Learner(BaseLearner):
             loss = torch.nn.functional.cross_entropy(sim, torch.arange(0, sim.shape[0]).long().to(self._device))
             return self.args["reg"] * loss
             # return 0.0
-    
+
     def _eval_cnn(self, loader):
         self._network.eval()
         y_pred, y_true = [], []
-        orig_y_pred = []
-        MAX_ITER = 4
-        class_stats = defaultdict(lambda: {
-            "count": 0,
-            "correct": 0,
-            # "wrong_adapter_ids": Counter(),
-            # "correct_iter_hist": Counter(),
-            # "wrong_iter_hist": Counter(),
-        })
+
+        class_stats = defaultdict(lambda: {"count": 0, "correct": 0})
+
+        # Pre-compute prototype information
+        prototype_matrix = []
+        class_indices = sorted(self.cls_mean.keys())
+        for class_idx in class_indices:
+            prototype_matrix.append(self.cls_mean[class_idx])
+        prototype_matrix = torch.stack(prototype_matrix).to(self._device)  # [num_classes, feature_dim]
 
         for _, (_, inputs, targets) in enumerate(loader):
             inputs = inputs.to(self._device)
             with torch.no_grad():
-                orig_logits = self._network.forward_orig(inputs)["logits"][:, :self._total_classes]
-                orig_preds = torch.max(orig_logits, dim=1)[1].cpu().numpy()
-                orig_idx = torch.tensor([self.cls2task[v] for v in orig_preds], device=self._device)
-                
-                # test the accuracy of the original model
-                orig_y_pred.append(orig_preds)
-                
-                all_features = torch.zeros(len(inputs), self._cur_task + 1, self._network.backbone.out_dim, device=self._device)
-                for t_id in range(self._cur_task + 1):
-                    t_features = self._network.backbone(inputs, adapter_id=t_id, train=False)["features"]
-                    all_features[:, t_id, :] = t_features
-                
-                # self-refined
+                # Extract features from all adapters for all samples
+                all_adapter_features = []
+                for task_id in range(self._cur_task + 1):
+                    features = self._network.backbone(inputs, adapter_id=task_id, train=False)["features"]
+                    all_adapter_features.append(features)  # Each is [B, feature_dim]
+
                 final_logits = []
-                
-                for x_id in range(len(inputs)):
-                    loop_num = 0
-                    prev_adapter_idx = orig_idx[x_id]
-                    while True:
-                        loop_num += 1
-                        cur_feature = all_features[x_id, prev_adapter_idx].unsqueeze(0) # shape=[1, 768]
-                        cur_logits = self._network.backbone(cur_feature, fc_only=True)["logits"][:, :self._total_classes]
-                        cur_pred = torch.max(cur_logits, dim=1)[1].cpu().numpy()
-                        cur_adapter_idx = torch.tensor([self.cls2task[v] for v in cur_pred], device=self._device)[0]
-                        
-                        if loop_num >= MAX_ITER or cur_adapter_idx == prev_adapter_idx:
-                            break
-                        else:
-                            prev_adapter_idx = cur_adapter_idx
-                        
-                    final_logits.append(cur_logits)
 
-                    # logging refinement statistics
-                    label = targets[x_id].item()
-                    pred = cur_pred[0]
+                # Process each sample
+                for sample_idx in range(inputs.size(0)):
+                    # Collect features from all adapters for this sample
+                    sample_features = [feature[sample_idx] for feature in all_adapter_features]
 
-                    stat = class_stats[label]
-                    stat["count"] += 1
-                    if pred == label:
-                        stat["correct"] += 1
-                    #     stat["correct_iter_hist"][loop_num] += 1
-                    # else:
-                    #     stat["wrong_iter_hist"][loop_num] += 1
-                    #     stat["wrong_adapter_ids"][prev_adapter_idx.item()] += 1
+                    # Find nearest prototype
+                    min_dist = float('inf')
+                    best_task_id = 0
 
-                final_logits = torch.cat(final_logits, dim=0).to(self._device)
+                    for idx, class_idx in enumerate(class_indices):
+                        # Use features from the adapter that matches the prototype's task
+                        prototype = prototype_matrix[idx].unsqueeze(0)
+                        proto_task = self.cls2task[class_idx]
+                        sample_task_features = sample_features[proto_task].unsqueeze(0)
 
-                if self.ensemble:
-                    final_logits = F.softmax(final_logits, dim=1)
-                    orig_logits = F.softmax(orig_logits / (1/(self._cur_task+1)), dim=1)
-                    outputs = final_logits + orig_logits
-                else:
-                    outputs = final_logits
-                
-            predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
-            )[
-                1
-            ]  # [bs, topk]
+                        # Compute distance
+                        sample_task_features = F.normalize(sample_task_features, dim=1)
+                        prototype = F.normalize(prototype, dim=1)
+                        dist = 1 - F.cosine_similarity(sample_task_features, prototype, dim=1).item()
+
+                        if dist < min_dist:
+                            min_dist = dist
+                            best_task_id = proto_task
+
+                    # Get final prediction using best adapter
+                    best_features = sample_features[best_task_id].unsqueeze(0)
+                    sample_logits = self._network.backbone(best_features, fc_only=True)["logits"][:, :self._total_classes]
+                    final_logits.append(sample_logits)
+
+                final_logits = torch.cat(final_logits, dim=0)
+                outputs = final_logits
+
+            predicts = torch.topk(outputs, k=self.topk, dim=1, largest=True, sorted=True)[1]
+            batch_predictions = predicts[:, 0].cpu().numpy()  # Top-1 predictions
+            batch_targets = targets.cpu().numpy()
+
+            for pred, true_label in zip(batch_predictions, batch_targets):
+                class_stats[true_label]["count"] += 1
+                if pred == true_label:
+                    class_stats[true_label]["correct"] += 1
+
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
 
-        orig_acc = (np.concatenate(orig_y_pred) == np.concatenate(y_true)).sum() * 100 / len(np.concatenate(y_true))
-        logging.info("the accuracy of the original model:{}".format(np.around(orig_acc, 2)))
-
-        # # logging class-wise refinement statistics
-        # logging.info(f"{'Class':<6} {'Count':<6} {'Acc':<7} {'CorrectIterHist':<35} {'WrongIterHist':<35} {'WrongAdapters':<20}")
-        # logging.info("-" * 160)
-        # for cls in sorted(class_stats.keys()):
-        #     entry = class_stats[cls]
-        #     acc = 100 * entry["correct"] / entry["count"] if entry["count"] > 0 else 0
-        #     correct_hist = dict(entry["correct_iter_hist"])
-        #     wrong_hist = dict(entry["wrong_iter_hist"])
-        #     wrong_adapter_summary = dict(entry["wrong_adapter_ids"])
-
-        #     logging.info(f"{cls:<6} {entry['count']:<6} {acc:<7.2f} {str(correct_hist):<35} {str(wrong_hist):<35} {str(wrong_adapter_summary):<20}")
-
-        # y_pred_flat = np.concatenate(y_pred)[:, 0]  # Take top-1 prediction
-        # y_true_flat = np.concatenate(y_true)
-        # cm = confusion_matrix(y_true_flat, y_pred_flat, labels=np.arange(self._total_classes))
-
-        # init_cls = 0 if self.args ["init_cls"] == self.args["increment"] else self.args["init_cls"]
-        # class_order_mode = self.args.get("class_order_mode", "random")
-        # logs_dir = os.path.join(
-        #     "logs",
-        #     self.args["model_name"],
-        #     self.args["dataset"],
-        #     str(init_cls),
-        #     str(self.args["increment"]),
-        #     class_order_mode,
-        #     "confusions"
-        # )
-        # os.makedirs(logs_dir, exist_ok=True)
-        # cm_save_path = os.path.join(logs_dir, f"cm_task_{self._cur_task}.npy")
-        # np.save(cm_save_path, cm)
+        y_pred_all = np.concatenate(y_pred)[:, 0]  # Top-1 predictions
+        y_true_all = np.concatenate(y_true)
+        acc = (y_pred_all == y_true_all).sum() * 100 / len(y_true_all)
+        logging.info("Prototype matched inference accuracy: {:.2f}%".format(acc))
 
         # logging long-tail accuracies
         if "lt" in self.args["dataset"] and self.args["dataset"] in LONGTAIL_SPLIT_SPEC:

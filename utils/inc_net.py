@@ -204,7 +204,7 @@ def get_backbone(args, pretrained=False):
         return model
     elif '_mos' in name:
         ffn_num = args["ffn_num"]
-        if args["model_name"] == "mos":
+        if args["model_name"] == "mos" or args["model_name"] == "bmsa":
             from backbone import vit_mos
             from easydict import EasyDict
             tuning_config = EasyDict(
@@ -1244,7 +1244,7 @@ class MOSNet(nn.Module):
                 
         return res
         
-    def forward(self, x, adapter_id=-1, train=False, fc_only=False, targets=None, return_loss=False):
-        res = self.backbone(x, adapter_id, train, fc_only, targets=targets, return_loss=return_loss)
+    def forward(self, x, adapter_id=-1, train=False, fc_only=False):
+        res = self.backbone(x, adapter_id, train, fc_only)
 
         return res
